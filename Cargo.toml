@@ -1,0 +1,42 @@
+[package]
+name = "open-agent-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Open Agent SDK - A Rust framework for building autonomous AI agents"
+license = "MIT"
+repository = "https://github.com/codeany-ai/open-agent-sdk-rust"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+glob = "0.3"
+regex = "1"
+chrono = "0.4"
+async-trait = "0.1"
+thiserror = "2"
+bytes = "1"
+pin-project-lite = "0.2"
+tracing = "0.1"
+base64 = "0.22"
+tokio-util = "0.7"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+[[example]]
+name = "simple_query"
+path = "examples/simple_query.rs"
+
+[[example]]
+name = "custom_tools"
+path = "examples/custom_tools.rs"
+
+[[example]]
+name = "multi_turn"
+path = "examples/multi_turn.rs"
