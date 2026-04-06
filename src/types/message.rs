@@ -174,6 +174,21 @@ pub enum SDKMessage {
     #[serde(rename = "progress")]
     Progress { message: String },
 
+    #[serde(rename = "tool_start")]
+    ToolStart {
+        tool_use_id: String,
+        tool_name: String,
+        input: Value,
+    },
+
+    #[serde(rename = "permission_request")]
+    PermissionRequest {
+        tool_use_id: String,
+        tool_name: String,
+        input: Value,
+        risk_level: String,
+    },
+
     #[serde(rename = "error")]
     Error { message: String },
 }

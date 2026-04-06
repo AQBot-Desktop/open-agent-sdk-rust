@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 pub struct ToolInputSchema {
     #[serde(rename = "type")]
     pub schema_type: String,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
     pub properties: HashMap<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required: Vec<String>,
@@ -134,9 +134,9 @@ pub enum PermissionDecision {
     AllowWithModifiedInput(Value),
 }
 
-/// Callback function for custom permission logic.
+/// Callback function for custom permission logic (async).
 pub type CanUseToolFn =
-    Arc<dyn Fn(&str, &Value) -> PermissionDecision + Send + Sync>;
+    Arc<dyn Fn(&str, &Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = PermissionDecision> + Send>> + Send + Sync>;
 
 /// The core trait that all tools must implement.
 #[async_trait]

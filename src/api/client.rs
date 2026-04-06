@@ -120,6 +120,17 @@ impl ApiClient {
         Self::with_api_type(api_key, base_url, model, None)
     }
 
+    /// Create a client using a pre-built LLM provider.
+    pub fn with_provider(provider: Arc<dyn LLMProvider>, model: Option<String>) -> Self {
+        let api_type = provider.api_type();
+        let model = model.unwrap_or_else(|| "sonnet-4-6".to_string());
+        Self {
+            provider,
+            model,
+            api_type,
+        }
+    }
+
     /// Create a client with an explicit API type override.
     pub fn with_api_type(
         api_key: Option<String>,

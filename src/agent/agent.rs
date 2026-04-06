@@ -17,6 +17,8 @@ pub struct AgentOptions {
     pub api_key: Option<String>,
     /// Custom API base URL.
     pub base_url: Option<String>,
+    /// Custom LLM provider (bypasses built-in ApiClient creation).
+    pub provider: Option<Arc<dyn crate::LLMProvider>>,
     /// Working directory for tool execution.
     pub cwd: Option<String>,
     /// Custom system prompt (replaces default).
@@ -79,6 +81,7 @@ impl Default for AgentOptions {
             model: None,
             api_key: None,
             base_url: None,
+            provider: None,
             cwd: None,
             system_prompt: None,
             append_system_prompt: None,
@@ -158,11 +161,15 @@ impl Agent {
             .cwd
             .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
 
-        let api_client = ApiClient::new(
-            options.api_key,
-            options.base_url,
-            options.model,
-        );
+        let api_client = if let Some(provider) = options.provider {
+            ApiClient::with_provider(provider, options.model)
+        } else {
+            ApiClient::new(
+                options.api_key,
+                options.base_url,
+                options.model,
+            )
+        };
 
         let mut registry = ToolRegistry::default_registry();
 

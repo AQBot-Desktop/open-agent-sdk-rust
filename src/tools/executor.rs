@@ -1,9 +1,10 @@
 use crate::types::{
     CanUseToolFn, ContentBlock, Message, MessageRole, PermissionDecision,
-    Tool, ToolError, ToolResult, ToolResultContentBlock, ToolUseContext,
+    SDKMessage, Tool, ToolError, ToolResult, ToolResultContentBlock, ToolUseContext,
 };
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use super::registry::ToolRegistry;
 
@@ -14,6 +15,7 @@ pub async fn execute_tools(
     registry: &ToolRegistry,
     context: &ToolUseContext,
     permission_fn: Option<&CanUseToolFn>,
+    event_sender: Option<mpsc::Sender<SDKMessage>>,
 ) -> Vec<(String, String, ToolResult)> {
     let tool_uses: Vec<(String, String, Value)> = message
         .content
@@ -61,8 +63,16 @@ pub async fn execute_tools(
             let ctx = context.clone();
             let perm_fn = permission_fn.cloned();
             let tool = tool.clone();
+            let sender = event_sender.clone();
             handles.push(tokio::spawn(async move {
-                let input = check_permission(&name, input, perm_fn.as_ref());
+                if let Some(sender) = &sender {
+                    let _ = sender.send(SDKMessage::ToolStart {
+                        tool_use_id: id.clone(),
+                        tool_name: name.clone(),
+                        input: input.clone(),
+                    }).await;
+                }
+                let input = check_permission(&name, input, perm_fn.as_ref()).await;
                 match input {
                     Ok(input) => {
                         let result = tool.call(input, &ctx).await;
@@ -86,7 +96,14 @@ pub async fn execute_tools(
 
     // Run sequential tools one at a time
     for (id, name, input, tool) in sequential_calls {
-        let input = check_permission(&name, input, permission_fn);
+        if let Some(sender) = &event_sender {
+            let _ = sender.send(SDKMessage::ToolStart {
+                tool_use_id: id.clone(),
+                tool_name: name.clone(),
+                input: input.clone(),
+            }).await;
+        }
+        let input = check_permission(&name, input, permission_fn).await;
         match input {
             Ok(input) => {
                 let result = tool.call(input, context).await;
@@ -105,13 +122,13 @@ pub async fn execute_tools(
     results
 }
 
-fn check_permission(
+async fn check_permission(
     tool_name: &str,
     input: Value,
     permission_fn: Option<&CanUseToolFn>,
 ) -> Result<Value, String> {
     if let Some(perm_fn) = permission_fn {
-        match perm_fn(tool_name, &input) {
+        match perm_fn(tool_name, &input).await {
             PermissionDecision::Allow => Ok(input),
             PermissionDecision::Deny(msg) => Err(msg),
             PermissionDecision::AllowWithModifiedInput(new_input) => Ok(new_input),
