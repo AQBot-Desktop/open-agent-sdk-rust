@@ -3,9 +3,10 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use tokio::sync::mpsc;
 
 use crate::types::{
-    ApiToolParam, ContentBlock, Message, MessageRole, SystemBlock, ThinkingConfig, Usage,
+    ApiToolParam, ContentBlock, Message, MessageRole, SDKMessage, SystemBlock, ThinkingConfig, Usage,
 };
 
 use super::provider::{ApiType, LLMProvider, ProviderRequest, ProviderResponse};
@@ -95,6 +96,7 @@ impl LLMProvider for OpenAIProvider {
     async fn create_message(
         &self,
         request: ProviderRequest<'_>,
+        _stream_tx: Option<mpsc::Sender<SDKMessage>>,
     ) -> Result<ProviderResponse, ApiError> {
         // Convert messages to OpenAI format
         let mut openai_messages = Vec::new();

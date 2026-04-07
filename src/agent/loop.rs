@@ -112,6 +112,7 @@ pub(crate) async fn run_loop(
                     Some(api_tools_ref.clone()),
                     max_tokens,
                     thinking_ref.clone(),
+                    Some(tx.clone()),
                 )
                 .await
         })

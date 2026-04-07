@@ -1,5 +1,6 @@
-use crate::types::{ApiToolParam, ContentBlock, Message, SystemBlock, ThinkingConfig, Usage};
+use crate::types::{ApiToolParam, ContentBlock, Message, SDKMessage, SystemBlock, ThinkingConfig, Usage};
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 
 /// API type identifier.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +36,7 @@ pub trait LLMProvider: Send + Sync {
     async fn create_message(
         &self,
         request: ProviderRequest<'_>,
+        stream_tx: Option<mpsc::Sender<SDKMessage>>,
     ) -> Result<ProviderResponse, super::ApiError>;
 }
 

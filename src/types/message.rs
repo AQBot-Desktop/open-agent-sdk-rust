@@ -191,6 +191,14 @@ pub enum SDKMessage {
 
     #[serde(rename = "error")]
     Error { message: String },
+
+    /// Real-time thinking delta from the API stream.
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta { thinking: String },
+
+    /// Real-time text delta from the API stream.
+    #[serde(rename = "text_delta")]
+    TextDelta { text: String },
 }
 
 /// Query result returned by the blocking `prompt()` method.

@@ -1,12 +1,14 @@
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use tokio::sync::mpsc;
 
 use crate::types::{
     ApiToolParam, ContentBlock, ImageContentSource, Message, MessageRole,
-    SystemBlock, ThinkingConfig, Usage,
+    SDKMessage, SystemBlock, ThinkingConfig, Usage,
 };
 
 use super::provider::{ApiType, LLMProvider, ProviderRequest, ProviderResponse};
@@ -67,6 +69,7 @@ impl LLMProvider for AnthropicProvider {
     async fn create_message(
         &self,
         request: ProviderRequest<'_>,
+        stream_tx: Option<mpsc::Sender<SDKMessage>>,
     ) -> Result<ProviderResponse, ApiError> {
         let api_messages: Vec<AnthropicMessage> = request
             .messages
@@ -135,124 +138,146 @@ impl LLMProvider for AnthropicProvider {
             });
         }
 
-        parse_anthropic_stream(response).await
+        parse_anthropic_stream(response, stream_tx).await
     }
 }
 
-/// Parse Anthropic SSE stream into a ProviderResponse.
+/// Parse Anthropic SSE stream into a ProviderResponse, emitting real-time
+/// thinking/text deltas via the optional `stream_tx` channel.
 async fn parse_anthropic_stream(
     response: reqwest::Response,
+    stream_tx: Option<mpsc::Sender<SDKMessage>>,
 ) -> Result<ProviderResponse, ApiError> {
-    let body = response
-        .text()
-        .await
-        .map_err(|e| ApiError::NetworkError(e.to_string()))?;
-
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
     let mut usage = Usage::default();
     let mut stop_reason: Option<String> = None;
     let mut current_blocks: HashMap<usize, Value> = HashMap::new();
 
-    for line in body.lines() {
-        let line = line.trim();
-        if !line.starts_with("data: ") {
-            continue;
-        }
-        let data = &line[6..];
-        if data == "[DONE]" {
-            break;
-        }
+    // Stream the response body line-by-line instead of buffering the entire body
+    let mut byte_stream = response.bytes_stream();
+    let mut line_buf = String::new();
 
-        let event: Value = match serde_json::from_str(data) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+    while let Some(chunk_result) = byte_stream.next().await {
+        let chunk = chunk_result.map_err(|e| ApiError::NetworkError(e.to_string()))?;
+        line_buf.push_str(&String::from_utf8_lossy(&chunk));
 
-        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        // Process all complete lines in the buffer
+        while let Some(newline_pos) = line_buf.find('\n') {
+            let raw_line = line_buf[..newline_pos].trim_end_matches('\r').to_string();
+            line_buf = line_buf[newline_pos + 1..].to_string();
 
-        match event_type {
-            "message_start" => {
-                if let Some(u) = event.pointer("/message/usage") {
-                    if let Ok(u) = serde_json::from_value::<Usage>(u.clone()) {
-                        usage.input_tokens = u.input_tokens;
-                        usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
-                        usage.cache_read_input_tokens = u.cache_read_input_tokens;
+            let line = raw_line.trim();
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let data = &line[6..];
+            if data == "[DONE]" {
+                break;
+            }
+
+            let event: Value = match serde_json::from_str(data) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            match event_type {
+                "message_start" => {
+                    if let Some(u) = event.pointer("/message/usage") {
+                        if let Ok(u) = serde_json::from_value::<Usage>(u.clone()) {
+                            usage.input_tokens = u.input_tokens;
+                            usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
+                            usage.cache_read_input_tokens = u.cache_read_input_tokens;
+                        }
                     }
                 }
-            }
-            "content_block_start" => {
-                if let (Some(idx), Some(block)) = (
-                    event.get("index").and_then(|i| i.as_u64()).map(|i| i as usize),
-                    event.get("content_block"),
-                ) {
-                    current_blocks.insert(idx, block.clone());
+                "content_block_start" => {
+                    if let (Some(idx), Some(block)) = (
+                        event.get("index").and_then(|i| i.as_u64()).map(|i| i as usize),
+                        event.get("content_block"),
+                    ) {
+                        current_blocks.insert(idx, block.clone());
+                    }
                 }
-            }
-            "content_block_delta" => {
-                let idx = event.get("index").and_then(|i| i.as_u64()).map(|i| i as usize);
-                let delta = event.get("delta");
-                if let (Some(idx), Some(delta)) = (idx, delta) {
-                    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match delta_type {
-                        "text_delta" => {
-                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                let block = current_blocks
-                                    .entry(idx)
-                                    .or_insert_with(|| serde_json::json!({"type": "text", "text": ""}));
-                                let existing = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                                block["text"] = Value::String(format!("{}{}", existing, text));
-                            }
-                        }
-                        "input_json_delta" => {
-                            if let Some(partial) = delta.get("partial_json").and_then(|t| t.as_str()) {
-                                let block = current_blocks.entry(idx).or_insert_with(|| {
-                                    serde_json::json!({"type": "tool_use", "id": "", "name": "", "input": {}})
-                                });
-                                let existing = block.get("_partial_json").and_then(|t| t.as_str()).unwrap_or("");
-                                block["_partial_json"] = Value::String(format!("{}{}", existing, partial));
-                            }
-                        }
-                        "thinking_delta" => {
-                            if let Some(thinking) = delta.get("thinking").and_then(|t| t.as_str()) {
-                                let block = current_blocks
-                                    .entry(idx)
-                                    .or_insert_with(|| serde_json::json!({"type": "thinking", "thinking": ""}));
-                                let existing = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
-                                block["thinking"] = Value::String(format!("{}{}", existing, thinking));
-                            }
-                        }
-                        "signature_delta" => {
-                            if let Some(sig) = delta.get("signature").and_then(|t| t.as_str()) {
-                                if let Some(block) = current_blocks.get_mut(&idx) {
-                                    block["signature"] = Value::String(sig.to_string());
+                "content_block_delta" => {
+                    let idx = event.get("index").and_then(|i| i.as_u64()).map(|i| i as usize);
+                    let delta = event.get("delta");
+                    if let (Some(idx), Some(delta)) = (idx, delta) {
+                        let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        match delta_type {
+                            "text_delta" => {
+                                if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                    let block = current_blocks
+                                        .entry(idx)
+                                        .or_insert_with(|| serde_json::json!({"type": "text", "text": ""}));
+                                    let existing = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                                    block["text"] = Value::String(format!("{}{}", existing, text));
+                                    // Emit real-time text delta
+                                    if let Some(ref tx) = stream_tx {
+                                        let _ = tx.try_send(SDKMessage::TextDelta {
+                                            text: text.to_string(),
+                                        });
+                                    }
                                 }
                             }
+                            "input_json_delta" => {
+                                if let Some(partial) = delta.get("partial_json").and_then(|t| t.as_str()) {
+                                    let block = current_blocks.entry(idx).or_insert_with(|| {
+                                        serde_json::json!({"type": "tool_use", "id": "", "name": "", "input": {}})
+                                    });
+                                    let existing = block.get("_partial_json").and_then(|t| t.as_str()).unwrap_or("");
+                                    block["_partial_json"] = Value::String(format!("{}{}", existing, partial));
+                                }
+                            }
+                            "thinking_delta" => {
+                                if let Some(thinking) = delta.get("thinking").and_then(|t| t.as_str()) {
+                                    let block = current_blocks
+                                        .entry(idx)
+                                        .or_insert_with(|| serde_json::json!({"type": "thinking", "thinking": ""}));
+                                    let existing = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                                    block["thinking"] = Value::String(format!("{}{}", existing, thinking));
+                                    // Emit real-time thinking delta
+                                    if let Some(ref tx) = stream_tx {
+                                        let _ = tx.try_send(SDKMessage::ThinkingDelta {
+                                            thinking: thinking.to_string(),
+                                        });
+                                    }
+                                }
+                            }
+                            "signature_delta" => {
+                                if let Some(sig) = delta.get("signature").and_then(|t| t.as_str()) {
+                                    if let Some(block) = current_blocks.get_mut(&idx) {
+                                        block["signature"] = Value::String(sig.to_string());
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
-            }
-            "content_block_stop" => {
-                let idx = event.get("index").and_then(|i| i.as_u64()).map(|i| i as usize);
-                if let Some(idx) = idx {
-                    if let Some(block) = current_blocks.remove(&idx) {
-                        if let Some(cb) = parse_anthropic_content_block(block) {
-                            content_blocks.push(cb);
+                "content_block_stop" => {
+                    let idx = event.get("index").and_then(|i| i.as_u64()).map(|i| i as usize);
+                    if let Some(idx) = idx {
+                        if let Some(block) = current_blocks.remove(&idx) {
+                            if let Some(cb) = parse_anthropic_content_block(block) {
+                                content_blocks.push(cb);
+                            }
                         }
                     }
                 }
-            }
-            "message_delta" => {
-                if let Some(sr) = event.pointer("/delta/stop_reason").and_then(|s| s.as_str()) {
-                    stop_reason = Some(sr.to_string());
-                }
-                if let Some(u) = event.get("usage") {
-                    if let Some(out) = u.get("output_tokens").and_then(|o| o.as_u64()) {
-                        usage.output_tokens = out;
+                "message_delta" => {
+                    if let Some(sr) = event.pointer("/delta/stop_reason").and_then(|s| s.as_str()) {
+                        stop_reason = Some(sr.to_string());
+                    }
+                    if let Some(u) = event.get("usage") {
+                        if let Some(out) = u.get("output_tokens").and_then(|o| o.as_u64()) {
+                            usage.output_tokens = out;
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 

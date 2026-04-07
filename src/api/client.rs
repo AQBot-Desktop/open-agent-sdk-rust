@@ -1,11 +1,12 @@
 use crate::types::{
-    ApiToolParam, Message, SystemBlock, ThinkingConfig, Usage,
+    ApiToolParam, Message, SDKMessage, SystemBlock, ThinkingConfig, Usage,
 };
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 use super::anthropic::AnthropicProvider;
 use super::openai::OpenAIProvider;
@@ -221,6 +222,7 @@ impl ApiClient {
         tools: Option<Vec<ApiToolParam>>,
         max_tokens: Option<u64>,
         thinking: Option<ThinkingConfig>,
+        stream_tx: Option<mpsc::Sender<SDKMessage>>,
     ) -> Result<ProviderResponse, ApiError> {
         let model_config = self.model_config();
         let max_tokens = max_tokens.unwrap_or(model_config.max_output_tokens);
@@ -234,7 +236,7 @@ impl ApiClient {
             thinking,
         };
 
-        self.provider.create_message(request).await
+        self.provider.create_message(request, stream_tx).await
     }
 
     /// Legacy method: send streaming request and return raw reqwest::Response.
