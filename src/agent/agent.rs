@@ -39,6 +39,8 @@ pub struct AgentOptions {
     pub disallowed_tools: Option<Vec<String>>,
     /// Custom permission callback.
     pub can_use_tool: Option<CanUseToolFn>,
+    /// Callback for user interaction (AskUserQuestion tool).
+    pub ask_fn: Option<crate::tools::askuser::AskUserFn>,
     /// Custom tools to register.
     pub custom_tools: Vec<Arc<dyn Tool>>,
     /// MCP server configurations.
@@ -94,6 +96,7 @@ impl Default for AgentOptions {
             allowed_tools: None,
             disallowed_tools: None,
             can_use_tool: None,
+            ask_fn: None,
             custom_tools: Vec::new(),
             mcp_servers: HashMap::new(),
             agents: HashMap::new(),
@@ -177,6 +180,11 @@ impl Agent {
         };
 
         let mut registry = ToolRegistry::default_registry();
+
+        // Replace default AskUserTool with configured one if ask_fn is provided
+        if let Some(ask_fn) = options.ask_fn {
+            registry.register_replace(Arc::new(crate::tools::askuser::AskUserTool::new(ask_fn)));
+        }
 
         // Register custom tools
         for tool in options.custom_tools {

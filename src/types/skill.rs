@@ -62,7 +62,6 @@ where
 /// Where a skill was loaded from (priority order, highest first).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SkillSource {
-    Builtin,
     AQBot,
     Claude,
     Agents,
@@ -72,7 +71,6 @@ pub enum SkillSource {
 impl SkillSource {
     pub fn as_str(&self) -> &'static str {
         match self {
-            SkillSource::Builtin => "builtin",
             SkillSource::AQBot => "aqbot",
             SkillSource::Claude => "claude",
             SkillSource::Agents => "agents",
