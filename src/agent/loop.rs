@@ -15,6 +15,7 @@ pub(crate) async fn run_loop(
     cwd: &str,
     system_prompt: Option<&str>,
     append_system_prompt: Option<&str>,
+    skills_summary: Option<&str>,
     max_turns: u32,
     max_budget_usd: Option<f64>,
     cost_tracker: &CostTracker,
@@ -26,7 +27,7 @@ pub(crate) async fn run_loop(
     let tool_context = ToolUseContext::new(cwd.to_string());
 
     // Build system prompt blocks
-    let system_blocks = context::build_system_blocks(cwd, system_prompt, append_system_prompt);
+    let system_blocks = context::build_system_blocks(cwd, system_prompt, append_system_prompt, skills_summary);
 
     // Build tool definitions for API
     let api_tools: Vec<ApiToolParam> = registry

@@ -25,6 +25,7 @@ pub mod hooks;
 pub mod mcp;
 pub mod permissions;
 pub mod session;
+pub mod skills;
 pub mod tools;
 pub mod types;
 pub mod utils;

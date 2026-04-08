@@ -25,6 +25,8 @@ pub struct AgentOptions {
     pub system_prompt: Option<String>,
     /// Additional text appended to the default system prompt.
     pub append_system_prompt: Option<String>,
+    /// Skills context summary for system prompt injection.
+    pub skills_summary: Option<String>,
     /// Maximum number of agentic turns (default: 100).
     pub max_turns: Option<u32>,
     /// Maximum budget in USD.
@@ -85,6 +87,7 @@ impl Default for AgentOptions {
             cwd: None,
             system_prompt: None,
             append_system_prompt: None,
+            skills_summary: None,
             max_turns: None,
             max_budget_usd: None,
             permission_mode: None,
@@ -134,6 +137,8 @@ pub struct Agent {
     pub system_prompt: Option<String>,
     /// Additional system prompt text.
     pub append_system_prompt: Option<String>,
+    /// Skills context summary.
+    pub skills_summary: Option<String>,
     /// Maximum agentic turns.
     pub max_turns: u32,
     /// Maximum budget in USD.
@@ -214,6 +219,7 @@ impl Agent {
             cwd,
             system_prompt: options.system_prompt,
             append_system_prompt: options.append_system_prompt,
+            skills_summary: options.skills_summary,
             max_turns: options.max_turns.unwrap_or(100),
             max_budget_usd: options.max_budget_usd,
             cost_tracker: CostTracker::new(),
@@ -245,6 +251,7 @@ impl Agent {
         let cwd = self.cwd.clone();
         let system_prompt = self.system_prompt.clone();
         let append_system_prompt = self.append_system_prompt.clone();
+        let skills_summary = self.skills_summary.clone();
         let max_turns = self.max_turns;
         let max_budget_usd = self.max_budget_usd;
         let cost_tracker = self.cost_tracker.clone();
@@ -261,6 +268,7 @@ impl Agent {
                 &cwd,
                 system_prompt.as_deref(),
                 append_system_prompt.as_deref(),
+                skills_summary.as_deref(),
                 max_turns,
                 max_budget_usd,
                 &cost_tracker,

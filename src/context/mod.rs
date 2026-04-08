@@ -101,6 +101,7 @@ pub fn build_system_blocks(
     cwd: &str,
     custom_system_prompt: Option<&str>,
     append_system_prompt: Option<&str>,
+    skills_summary: Option<&str>,
 ) -> Vec<SystemBlock> {
     let mut blocks = Vec::new();
 
@@ -135,6 +136,17 @@ pub fn build_system_blocks(
             text: user_context,
             cache_control: Some(CacheControl::ephemeral()),
         });
+    }
+
+    // Skills context
+    if let Some(skills) = skills_summary {
+        if !skills.is_empty() {
+            blocks.push(SystemBlock {
+                block_type: "text".to_string(),
+                text: skills.to_string(),
+                cache_control: Some(CacheControl::ephemeral()),
+            });
+        }
     }
 
     // Append system prompt
