@@ -163,14 +163,17 @@ async fn run_command(
     command: &str,
     working_dir: &str,
 ) -> Result<(String, String, i32), std::io::Error> {
-    let output = Command::new("bash")
-        .arg("-c")
+    let shell_path = crate::mcp::shell_path::get_shell_path();
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(working_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
+        .stderr(Stdio::piped());
+    if !shell_path.is_empty() {
+        cmd.env("PATH", shell_path);
+    }
+    let output = cmd.output().await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();

@@ -46,6 +46,12 @@ impl McpClient {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
 
+                // Inject login-shell PATH so GUI-launched apps can find
+                // tools installed via version managers (nvm, fnm, volta, …)
+                let shell_path = crate::mcp::shell_path::get_shell_path();
+                if !shell_path.is_empty() && !env.contains_key("PATH") {
+                    cmd.env("PATH", shell_path);
+                }
                 for (key, value) in env {
                     cmd.env(key, value);
                 }
