@@ -16,6 +16,8 @@ pub struct SkillMetadata {
     #[serde(default)]
     pub argument_hint: Option<String>,
     #[serde(default)]
+    pub when_to_use: Option<String>,
+    #[serde(default)]
     pub disable_model_invocation: bool,
     #[serde(default = "default_true")]
     pub user_invocable: bool,

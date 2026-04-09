@@ -71,7 +71,15 @@ impl SkillRegistry {
         for skill in &skills {
             summary.push_str(&format!("- **{}**", skill.name));
             if let Some(desc) = &skill.metadata.description {
+                let desc = if desc.len() > 250 {
+                    format!("{}...", &desc[..250])
+                } else {
+                    desc.clone()
+                };
                 summary.push_str(&format!(": {}", desc));
+            }
+            if let Some(when) = &skill.metadata.when_to_use {
+                summary.push_str(&format!(" TRIGGER when: {}", when));
             }
             if let Some(hint) = &skill.metadata.argument_hint {
                 summary.push_str(&format!(" (usage: /{})", hint));
@@ -79,7 +87,8 @@ impl SkillRegistry {
             summary.push('\n');
         }
         summary.push_str(
-            "\nWhen the Skill tool returns instructions, treat them as mandatory operational \
+            "\nWhen a skill matches the user's request, invoke it using the Skill tool. \
+             When the Skill tool returns instructions, treat them as mandatory operational \
              procedures, not as optional reference material. Follow the instructions step by step.\n",
         );
         summary
