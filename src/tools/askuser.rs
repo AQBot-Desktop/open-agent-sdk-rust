@@ -5,9 +5,19 @@ use std::sync::Arc;
 
 use crate::types::{Tool, ToolError, ToolInputSchema, ToolResult, ToolUseContext};
 
+/// Structured request passed to the ask callback.
+#[derive(Debug, Clone)]
+pub struct AskUserRequest {
+    pub question: String,
+    pub options: Option<Vec<String>>,
+}
+
 /// Callback function for asking the user a question.
-pub type AskUserFn =
-    Arc<dyn Fn(&str) -> futures::future::BoxFuture<'static, Result<String, String>> + Send + Sync>;
+pub type AskUserFn = Arc<
+    dyn Fn(AskUserRequest) -> futures::future::BoxFuture<'static, Result<String, String>>
+        + Send
+        + Sync,
+>;
 
 pub struct AskUserTool {
     ask_fn: Option<AskUserFn>,
@@ -34,19 +44,29 @@ impl Tool for AskUserTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the user a question and wait for their response. Use when you need clarification or input."
+        "Ask the user a question and wait for their response. Use when you need clarification or input. Optionally provide a list of options for the user to choose from."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
         ToolInputSchema {
             schema_type: "object".to_string(),
-            properties: HashMap::from([(
-                "question".to_string(),
-                json!({
-                    "type": "string",
-                    "description": "The question to ask the user"
-                }),
-            )]),
+            properties: HashMap::from([
+                (
+                    "question".to_string(),
+                    json!({
+                        "type": "string",
+                        "description": "The question to ask the user"
+                    }),
+                ),
+                (
+                    "options".to_string(),
+                    json!({
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of choices for the user to select from (multi-select). The user can also provide additional free-form input."
+                    }),
+                ),
+            ]),
             required: vec!["question".to_string()],
             additional_properties: Some(false),
         }
@@ -58,9 +78,22 @@ impl Tool for AskUserTool {
             .and_then(|q| q.as_str())
             .ok_or_else(|| ToolError::InvalidInput("Missing 'question' field".to_string()))?;
 
+        let options: Option<Vec<String>> = input.get("options").and_then(|o| {
+            o.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+        });
+
+        let request = AskUserRequest {
+            question: question.to_string(),
+            options,
+        };
+
         match &self.ask_fn {
             Some(ask_fn) => {
-                let answer = (ask_fn)(question)
+                let answer = (ask_fn)(request)
                     .await
                     .map_err(|e| ToolError::ExecutionError(e))?;
                 Ok(ToolResult::text(answer))
