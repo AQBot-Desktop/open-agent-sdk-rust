@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
 
@@ -70,10 +71,7 @@ impl Tool for BashTool {
     }
 
     fn is_read_only(&self, input: &Value) -> bool {
-        let command = input
-            .get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+        let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
 
         // Check if command starts with a read-only command
         let cmd_trimmed = command.trim();
@@ -83,11 +81,18 @@ impl Tool for BashTool {
             "type", "file", "stat", "du", "df",
         ];
         let prefix_reads = [
-            "git status", "git log", "git diff", "git show", "git branch",
-            "cargo check", "cargo test --no-run", "rustc --version",
+            "git status",
+            "git log",
+            "git diff",
+            "git show",
+            "git branch",
+            "cargo check",
+            "cargo test --no-run",
+            "rustc --version",
         ];
 
-        single_word_reads.contains(&first_cmd) || prefix_reads.iter().any(|p| cmd_trimmed.starts_with(p))
+        single_word_reads.contains(&first_cmd)
+            || prefix_reads.iter().any(|p| cmd_trimmed.starts_with(p))
     }
 
     async fn call(&self, input: Value, context: &ToolUseContext) -> Result<ToolResult, ToolError> {
@@ -164,9 +169,9 @@ async fn run_command(
     working_dir: &str,
 ) -> Result<(String, String, i32), std::io::Error> {
     let shell_path = crate::mcp::shell_path::get_shell_path();
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(command)
+    let shell = build_shell_runner(command);
+    let mut cmd = Command::new(&shell.program);
+    cmd.args(&shell.args)
         .current_dir(working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -182,6 +187,114 @@ async fn run_command(
     Ok((stdout, stderr, exit_code))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellRunner {
+    program: String,
+    args: Vec<String>,
+}
+
+fn build_shell_runner(command: &str) -> ShellRunner {
+    select_shell_runner(
+        command,
+        cfg!(windows),
+        std::env::var("ComSpec").ok(),
+        program_exists,
+    )
+}
+
+fn select_shell_runner<F>(
+    command: &str,
+    is_windows: bool,
+    comspec: Option<String>,
+    mut has_program: F,
+) -> ShellRunner
+where
+    F: FnMut(&str) -> bool,
+{
+    if is_windows {
+        for candidate in ["bash.exe", "bash"] {
+            if has_program(candidate) {
+                return ShellRunner {
+                    program: candidate.to_string(),
+                    args: vec!["-c".to_string(), command.to_string()],
+                };
+            }
+        }
+
+        for candidate in ["pwsh.exe", "pwsh", "powershell.exe", "powershell"] {
+            if has_program(candidate) {
+                return ShellRunner {
+                    program: candidate.to_string(),
+                    args: vec![
+                        "-NoLogo".to_string(),
+                        "-NoProfile".to_string(),
+                        "-NonInteractive".to_string(),
+                        "-Command".to_string(),
+                        command.to_string(),
+                    ],
+                };
+            }
+        }
+
+        return ShellRunner {
+            program: comspec
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "cmd.exe".to_string()),
+            args: vec![
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                command.to_string(),
+            ],
+        };
+    }
+
+    for candidate in ["/bin/bash", "bash", "/bin/sh", "sh"] {
+        if has_program(candidate) {
+            return ShellRunner {
+                program: candidate.to_string(),
+                args: vec!["-c".to_string(), command.to_string()],
+            };
+        }
+    }
+
+    ShellRunner {
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), command.to_string()],
+    }
+}
+
+fn program_exists(candidate: &str) -> bool {
+    if candidate.contains(std::path::MAIN_SEPARATOR)
+        || candidate.contains('/')
+        || candidate.contains('\\')
+    {
+        return Path::new(candidate).is_file();
+    }
+
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let full_path = dir.join(candidate);
+                if full_path.is_file() {
+                    return true;
+                }
+
+                #[cfg(windows)]
+                {
+                    let exe_path = dir.join(format!("{candidate}.exe"));
+                    return exe_path.is_file();
+                }
+
+                #[cfg(not(windows))]
+                {
+                    false
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn check_destructive(command: &str) -> Option<&'static str> {
     for pattern in DESTRUCTIVE_PATTERNS {
         if command.contains(pattern) {
@@ -189,4 +302,67 @@ fn check_destructive(command: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select_shell_runner, ShellRunner};
+
+    #[test]
+    fn select_shell_runner_falls_back_to_powershell_on_windows() {
+        let runner = select_shell_runner("node -v", true, None, |candidate| {
+            matches!(candidate, "pwsh.exe")
+        });
+
+        assert_eq!(
+            runner,
+            ShellRunner {
+                program: "pwsh.exe".to_string(),
+                args: vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    "node -v".to_string(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn select_shell_runner_falls_back_to_cmd_on_windows() {
+        let runner = select_shell_runner(
+            "node -v",
+            true,
+            Some("C:\\Windows\\System32\\cmd.exe".to_string()),
+            |_| false,
+        );
+
+        assert_eq!(
+            runner,
+            ShellRunner {
+                program: "C:\\Windows\\System32\\cmd.exe".to_string(),
+                args: vec![
+                    "/d".to_string(),
+                    "/s".to_string(),
+                    "/c".to_string(),
+                    "node -v".to_string(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn select_shell_runner_prefers_bash_on_unix() {
+        let runner =
+            select_shell_runner("node -v", false, None, |candidate| candidate == "/bin/bash");
+
+        assert_eq!(
+            runner,
+            ShellRunner {
+                program: "/bin/bash".to_string(),
+                args: vec!["-c".to_string(), "node -v".to_string()],
+            }
+        );
+    }
 }
