@@ -1,6 +1,6 @@
 use crate::types::{
-    CanUseToolFn, ContentBlock, Message, MessageRole, PermissionDecision,
-    SDKMessage, Tool, ToolError, ToolResult, ToolResultContentBlock, ToolUseContext,
+    CanUseToolFn, ContentBlock, Message, MessageRole, PermissionDecision, SDKMessage, Tool,
+    ToolError, ToolResult, ToolResultContentBlock, ToolUseContext,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -66,16 +66,19 @@ pub async fn execute_tools(
             let sender = event_sender.clone();
             handles.push(tokio::spawn(async move {
                 if let Some(sender) = &sender {
-                    let _ = sender.send(SDKMessage::ToolStart {
-                        tool_use_id: id.clone(),
-                        tool_name: name.clone(),
-                        input: input.clone(),
-                    }).await;
+                    let _ = sender
+                        .send(SDKMessage::ToolStart {
+                            tool_use_id: id.clone(),
+                            tool_name: name.clone(),
+                            input: input.clone(),
+                        })
+                        .await;
                 }
-                let input = check_permission(&name, input, perm_fn.as_ref()).await;
+                let input =
+                    check_permission(&name, input, perm_fn.as_ref(), &ctx.abort_signal).await;
                 match input {
                     Ok(input) => {
-                        let result = tool.call(input, &ctx).await;
+                        let result = call_tool_with_cancel(tool.as_ref(), input, &ctx).await;
                         let tool_result = match result {
                             Ok(r) => r,
                             Err(e) => ToolResult::error(e.to_string()),
@@ -97,16 +100,18 @@ pub async fn execute_tools(
     // Run sequential tools one at a time
     for (id, name, input, tool) in sequential_calls {
         if let Some(sender) = &event_sender {
-            let _ = sender.send(SDKMessage::ToolStart {
-                tool_use_id: id.clone(),
-                tool_name: name.clone(),
-                input: input.clone(),
-            }).await;
+            let _ = sender
+                .send(SDKMessage::ToolStart {
+                    tool_use_id: id.clone(),
+                    tool_name: name.clone(),
+                    input: input.clone(),
+                })
+                .await;
         }
-        let input = check_permission(&name, input, permission_fn).await;
+        let input = check_permission(&name, input, permission_fn, &context.abort_signal).await;
         match input {
             Ok(input) => {
-                let result = tool.call(input, context).await;
+                let result = call_tool_with_cancel(tool.as_ref(), input, context).await;
                 let tool_result = match result {
                     Ok(r) => r,
                     Err(e) => ToolResult::error(e.to_string()),
@@ -126,15 +131,35 @@ async fn check_permission(
     tool_name: &str,
     input: Value,
     permission_fn: Option<&CanUseToolFn>,
+    abort_signal: &tokio_util::sync::CancellationToken,
 ) -> Result<Value, String> {
+    if abort_signal.is_cancelled() {
+        return Err("Tool aborted".to_string());
+    }
+
     if let Some(perm_fn) = permission_fn {
-        match perm_fn(tool_name, &input).await {
+        let decision = tokio::select! {
+            decision = perm_fn(tool_name, &input) => decision,
+            _ = abort_signal.cancelled() => return Err("Tool aborted".to_string()),
+        };
+        match decision {
             PermissionDecision::Allow => Ok(input),
             PermissionDecision::Deny(msg) => Err(msg),
             PermissionDecision::AllowWithModifiedInput(new_input) => Ok(new_input),
         }
     } else {
         Ok(input)
+    }
+}
+
+async fn call_tool_with_cancel(
+    tool: &dyn Tool,
+    input: Value,
+    context: &ToolUseContext,
+) -> Result<ToolResult, ToolError> {
+    tokio::select! {
+        result = tool.call(input, context) => result,
+        _ = context.abort_signal.cancelled() => Ok(ToolResult::error("Tool aborted")),
     }
 }
 
@@ -148,9 +173,7 @@ pub fn build_tool_results_message(results: &[(String, String, ToolResult)]) -> M
                 .iter()
                 .map(|c| match c {
                     crate::types::ToolResultContent::Text { text } => {
-                        ToolResultContentBlock::Text {
-                            text: text.clone(),
-                        }
+                        ToolResultContentBlock::Text { text: text.clone() }
                     }
                     crate::types::ToolResultContent::Image { source } => {
                         ToolResultContentBlock::Image {

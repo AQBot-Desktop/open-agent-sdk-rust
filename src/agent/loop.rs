@@ -6,6 +6,7 @@ use crate::types::*;
 use crate::utils::{compact, messages as msg_utils, retry};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Run the main agentic loop.
 pub(crate) async fn run_loop(
@@ -22,12 +23,14 @@ pub(crate) async fn run_loop(
     thinking: Option<ThinkingConfig>,
     max_tokens: Option<u64>,
     can_use_tool: Option<&CanUseToolFn>,
+    abort_signal: CancellationToken,
     tx: mpsc::Sender<SDKMessage>,
 ) -> Result<Vec<Message>, String> {
-    let tool_context = ToolUseContext::new(cwd.to_string());
+    let tool_context = ToolUseContext::with_abort(cwd.to_string(), abort_signal);
 
     // Build system prompt blocks
-    let system_blocks = context::build_system_blocks(cwd, system_prompt, append_system_prompt, skills_summary);
+    let system_blocks =
+        context::build_system_blocks(cwd, system_prompt, append_system_prompt, skills_summary);
 
     // Build tool definitions for API
     let api_tools: Vec<ApiToolParam> = registry
@@ -62,6 +65,10 @@ pub(crate) async fn run_loop(
         .await;
 
     loop {
+        if tool_context.abort_signal.is_cancelled() {
+            return Err("Agent cancelled".to_string());
+        }
+
         // Check turn limit
         num_turns += 1;
         if num_turns > max_turns {
@@ -79,10 +86,7 @@ pub(crate) async fn run_loop(
             if current_cost >= budget {
                 let _ = tx
                     .send(SDKMessage::Progress {
-                        message: format!(
-                            "Budget exceeded: ${:.4} >= ${:.4}",
-                            current_cost, budget
-                        ),
+                        message: format!("Budget exceeded: ${:.4} >= ${:.4}", current_cost, budget),
                     })
                     .await;
                 break;
@@ -105,19 +109,23 @@ pub(crate) async fn run_loop(
 
         let start = std::time::Instant::now();
 
-        let response = retry::with_retry(&retry_config, || async {
-            api_client_ref
-                .create_message(
-                    &normalized,
-                    Some(system_blocks_ref.clone()),
-                    Some(api_tools_ref.clone()),
-                    max_tokens,
-                    thinking_ref.clone(),
-                    Some(tx.clone()),
-                )
-                .await
-        })
-        .await;
+        let response = tokio::select! {
+            response = retry::with_retry(&retry_config, || async {
+                api_client_ref
+                    .create_message(
+                        &normalized,
+                        Some(system_blocks_ref.clone()),
+                        Some(api_tools_ref.clone()),
+                        max_tokens,
+                        thinking_ref.clone(),
+                        Some(tx.clone()),
+                    )
+                    .await
+            }) => response,
+            _ = tool_context.abort_signal.cancelled() => {
+                return Err("Agent cancelled".to_string());
+            }
+        };
 
         let provider_response = match response {
             Ok(r) => r,
@@ -165,8 +173,18 @@ pub(crate) async fn run_loop(
 
         // Execute tools
         let tool_start = std::time::Instant::now();
-        let results =
-            tools::execute_tools(&assistant_msg, &registry, &tool_context, can_use_tool, Some(tx.clone())).await;
+        let results = tokio::select! {
+            results = tools::execute_tools(
+                &assistant_msg,
+                &registry,
+                &tool_context,
+                can_use_tool,
+                Some(tx.clone()),
+            ) => results,
+            _ = tool_context.abort_signal.cancelled() => {
+                return Err("Agent cancelled".to_string());
+            }
+        };
         let tool_duration = tool_start.elapsed().as_millis() as u64;
         cost_tracker.add_tool_duration(tool_duration).await;
 

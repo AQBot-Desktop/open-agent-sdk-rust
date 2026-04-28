@@ -130,10 +130,7 @@ async fn test_bash_exit_code() {
     let bash = registry.get("Bash").unwrap();
     let ctx = create_test_context("/tmp");
 
-    let result = bash
-        .call(json!({"command": "false"}), &ctx)
-        .await
-        .unwrap();
+    let result = bash.call(json!({"command": "false"}), &ctx).await.unwrap();
 
     assert!(result.is_error);
     assert!(result.get_text().contains("Exit code:"));
@@ -178,10 +175,7 @@ async fn test_read_file() {
     let ctx = create_test_context(dir.path().to_str().unwrap());
 
     let result = read
-        .call(
-            json!({"file_path": file_path.to_str().unwrap()}),
-            &ctx,
-        )
+        .call(json!({"file_path": file_path.to_str().unwrap()}), &ctx)
         .await
         .unwrap();
 
@@ -201,7 +195,10 @@ async fn test_read_file_not_found() {
     let ctx = create_test_context("/tmp");
 
     let result = read
-        .call(json!({"file_path": "/tmp/nonexistent_file_12345.txt"}), &ctx)
+        .call(
+            json!({"file_path": "/tmp/nonexistent_file_12345.txt"}),
+            &ctx,
+        )
         .await
         .unwrap();
 
@@ -245,10 +242,7 @@ async fn test_read_directory_error() {
     let read = registry.get("Read").unwrap();
     let ctx = create_test_context("/tmp");
 
-    let result = read
-        .call(json!({"file_path": "/tmp"}), &ctx)
-        .await
-        .unwrap();
+    let result = read.call(json!({"file_path": "/tmp"}), &ctx).await.unwrap();
 
     assert!(result.is_error);
     assert!(result.get_text().contains("directory"));
@@ -327,12 +321,9 @@ async fn test_edit_file() {
     let ctx = create_test_context(dir.path().to_str().unwrap());
 
     // Must read first for staleness tracking
-    read.call(
-        json!({"file_path": file_path.to_str().unwrap()}),
-        &ctx,
-    )
-    .await
-    .unwrap();
+    read.call(json!({"file_path": file_path.to_str().unwrap()}), &ctx)
+        .await
+        .unwrap();
 
     let result = edit
         .call(
@@ -364,12 +355,9 @@ async fn test_edit_string_not_found() {
     let read = registry.get("Read").unwrap();
     let ctx = create_test_context(dir.path().to_str().unwrap());
 
-    read.call(
-        json!({"file_path": file_path.to_str().unwrap()}),
-        &ctx,
-    )
-    .await
-    .unwrap();
+    read.call(json!({"file_path": file_path.to_str().unwrap()}), &ctx)
+        .await
+        .unwrap();
 
     let result = edit
         .call(
@@ -398,12 +386,9 @@ async fn test_edit_multiple_occurrences() {
     let read = registry.get("Read").unwrap();
     let ctx = create_test_context(dir.path().to_str().unwrap());
 
-    read.call(
-        json!({"file_path": file_path.to_str().unwrap()}),
-        &ctx,
-    )
-    .await
-    .unwrap();
+    read.call(json!({"file_path": file_path.to_str().unwrap()}), &ctx)
+        .await
+        .unwrap();
 
     // Without replace_all, should fail for multiple occurrences
     let result = edit
@@ -433,12 +418,9 @@ async fn test_edit_replace_all() {
     let read = registry.get("Read").unwrap();
     let ctx = create_test_context(dir.path().to_str().unwrap());
 
-    read.call(
-        json!({"file_path": file_path.to_str().unwrap()}),
-        &ctx,
-    )
-    .await
-    .unwrap();
+    read.call(json!({"file_path": file_path.to_str().unwrap()}), &ctx)
+        .await
+        .unwrap();
 
     let result = edit
         .call(
@@ -499,10 +481,7 @@ async fn test_glob_find_files() {
     let glob = registry.get("Glob").unwrap();
     let ctx = create_test_context(dir.path().to_str().unwrap());
 
-    let result = glob
-        .call(json!({"pattern": "*.rs"}), &ctx)
-        .await
-        .unwrap();
+    let result = glob.call(json!({"pattern": "*.rs"}), &ctx).await.unwrap();
 
     assert!(!result.is_error);
     let text = result.get_text();
@@ -519,10 +498,63 @@ async fn test_glob_no_matches() {
     let glob = registry.get("Glob").unwrap();
     let ctx = create_test_context(dir.path().to_str().unwrap());
 
+    let result = glob.call(json!({"pattern": "*.xyz"}), &ctx).await.unwrap();
+
+    assert!(!result.is_error);
+    assert!(result.get_text().contains("No files found"));
+}
+
+#[tokio::test]
+async fn test_glob_dot_lists_current_directory_without_recursing() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("root.rs"), "").unwrap();
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    std::fs::write(dir.path().join("nested").join("child.rs"), "").unwrap();
+
+    let registry = ToolRegistry::default_registry();
+    let glob = registry.get("Glob").unwrap();
+    let ctx = create_test_context(dir.path().to_str().unwrap());
+
+    let result = glob.call(json!({"pattern": "."}), &ctx).await.unwrap();
+
+    assert!(!result.is_error);
+    let text = result.get_text();
+    assert!(text.contains("root.rs"));
+    assert!(!text.contains("child.rs"));
+}
+
+#[tokio::test]
+async fn test_glob_skips_heavy_directories_before_descending() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+    std::fs::write(dir.path().join("node_modules").join("dep.rs"), "").unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("lib.rs"), "").unwrap();
+
+    let registry = ToolRegistry::default_registry();
+    let glob = registry.get("Glob").unwrap();
+    let ctx = create_test_context(dir.path().to_str().unwrap());
+
     let result = glob
-        .call(json!({"pattern": "*.xyz"}), &ctx)
+        .call(json!({"pattern": "**/*.rs"}), &ctx)
         .await
         .unwrap();
+
+    assert!(!result.is_error);
+    let text = result.get_text();
+    assert!(text.contains("lib.rs"));
+    assert!(!text.contains("dep.rs"));
+}
+
+#[tokio::test]
+async fn test_glob_returns_when_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = create_test_context(dir.path().to_str().unwrap());
+    ctx.abort_signal.cancel();
+    let registry = ToolRegistry::default_registry();
+    let glob = registry.get("Glob").unwrap();
+
+    let result = glob.call(json!({"pattern": "**/*"}), &ctx).await.unwrap();
 
     assert!(!result.is_error);
     assert!(result.get_text().contains("No files found"));
@@ -533,7 +565,11 @@ async fn test_glob_no_matches() {
 #[tokio::test]
 async fn test_grep_search() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("test.txt"), "hello world\nfoo bar\nhello again\n").unwrap();
+    std::fs::write(
+        dir.path().join("test.txt"),
+        "hello world\nfoo bar\nhello again\n",
+    )
+    .unwrap();
 
     let registry = ToolRegistry::default_registry();
     let grep = registry.get("Grep").unwrap();
@@ -609,10 +645,7 @@ async fn test_task_not_found() {
     let ctx = create_test_context("/tmp");
 
     let get = registry.get("TaskGet").unwrap();
-    let result = get
-        .call(json!({"id": "nonexistent"}), &ctx)
-        .await
-        .unwrap();
+    let result = get.call(json!({"id": "nonexistent"}), &ctx).await.unwrap();
     assert!(result.is_error);
     assert!(result.get_text().contains("not found"));
 }

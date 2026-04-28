@@ -39,17 +39,18 @@ pub use hooks::{
     NotificationLevel, PermissionBehavior, PermissionUpdate,
 };
 pub use mcp::McpClient;
-pub use tools::ToolRegistry;
-pub use types::{
-    ApiToolParam, CanUseToolFn, ContentBlock, Message, MessageRole, PermissionDecision,
-    PermissionMode, QueryResult, SDKMessage, ThinkingConfig, Tool, ToolError, ToolInputSchema,
-    SandboxFilesystemConfig, SandboxNetworkConfig, SandboxSettings, ToolResult, ToolResultContent,
-    ToolUseContext, Usage,
-};
 pub use session::{
     append_to_session, delete_session, fork_session, get_session_info, get_session_messages,
     list_sessions, load_session, new_metadata, rename_session, save_session, tag_session,
     SessionData, SessionMetadata,
+};
+pub use tokio_util::sync::CancellationToken;
+pub use tools::ToolRegistry;
+pub use types::{
+    ApiToolParam, CanUseToolFn, ContentBlock, Message, MessageRole, PermissionDecision,
+    PermissionMode, QueryResult, SDKMessage, SandboxFilesystemConfig, SandboxNetworkConfig,
+    SandboxSettings, ThinkingConfig, Tool, ToolError, ToolInputSchema, ToolResult,
+    ToolResultContent, ToolUseContext, Usage,
 };
 pub use utils::compact::{
     build_compaction_prompt, compact_conversation, strip_images_from_messages,

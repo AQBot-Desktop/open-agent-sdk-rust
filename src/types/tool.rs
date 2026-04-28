@@ -42,18 +42,14 @@ pub struct ToolResult {
 impl ToolResult {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
-            content: vec![ToolResultContent::Text {
-                text: text.into(),
-            }],
+            content: vec![ToolResultContent::Text { text: text.into() }],
             is_error: false,
         }
     }
 
     pub fn error(text: impl Into<String>) -> Self {
         Self {
-            content: vec![ToolResultContent::Text {
-                text: text.into(),
-            }],
+            content: vec![ToolResultContent::Text { text: text.into() }],
             is_error: true,
         }
     }
@@ -110,9 +106,16 @@ pub struct ToolUseContext {
 
 impl ToolUseContext {
     pub fn new(working_dir: String) -> Self {
+        Self::with_abort(working_dir, tokio_util::sync::CancellationToken::new())
+    }
+
+    pub fn with_abort(
+        working_dir: String,
+        abort_signal: tokio_util::sync::CancellationToken,
+    ) -> Self {
         Self {
             working_dir,
-            abort_signal: tokio_util::sync::CancellationToken::new(),
+            abort_signal,
             read_file_state: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -135,8 +138,15 @@ pub enum PermissionDecision {
 }
 
 /// Callback function for custom permission logic (async).
-pub type CanUseToolFn =
-    Arc<dyn Fn(&str, &Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = PermissionDecision> + Send>> + Send + Sync>;
+pub type CanUseToolFn = Arc<
+    dyn Fn(
+            &str,
+            &Value,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = PermissionDecision> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// The core trait that all tools must implement.
 #[async_trait]
@@ -145,11 +155,7 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn input_schema(&self) -> ToolInputSchema;
 
-    async fn call(
-        &self,
-        input: Value,
-        context: &ToolUseContext,
-    ) -> Result<ToolResult, ToolError>;
+    async fn call(&self, input: Value, context: &ToolUseContext) -> Result<ToolResult, ToolError>;
 
     fn is_read_only(&self, _input: &Value) -> bool {
         false

@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Configuration options for creating an agent.
 pub struct AgentOptions {
@@ -55,6 +56,8 @@ pub struct AgentOptions {
     pub json_schema: Option<Value>,
     /// Hook configuration.
     pub hooks: Option<HookConfig>,
+    /// Cancellation token used to stop the running agent loop and tools.
+    pub abort_signal: Option<CancellationToken>,
     /// Custom HTTP headers for API requests.
     pub custom_headers: HashMap<String, String>,
     /// Resume the most recent session in the current working directory.
@@ -104,6 +107,7 @@ impl Default for AgentOptions {
             max_tokens: None,
             json_schema: None,
             hooks: None,
+            abort_signal: None,
             custom_headers: HashMap::new(),
             continue_session: None,
             resume: None,
@@ -160,23 +164,23 @@ pub struct Agent {
     pub hooks: HookConfig,
     pub(crate) can_use_tool: Option<CanUseToolFn>,
     pub(crate) session_id: String,
+    pub(crate) abort_signal: CancellationToken,
 }
 
 impl Agent {
     /// Create a new agent with the given options.
     pub async fn new(options: AgentOptions) -> Result<Self, String> {
-        let cwd = options
-            .cwd
-            .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
+        let cwd = options.cwd.unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        });
 
         let api_client = if let Some(provider) = options.provider {
             ApiClient::with_provider(provider, options.model)
         } else {
-            ApiClient::new(
-                options.api_key,
-                options.base_url,
-                options.model,
-            )
+            ApiClient::new(options.api_key, options.base_url, options.model)
         };
 
         let mut registry = ToolRegistry::default_registry();
@@ -206,8 +210,7 @@ impl Agent {
         for (name, config) in &options.mcp_servers {
             match mcp_client.connect(name, config.clone()).await {
                 Ok(tools) => {
-                    let mcp_tools =
-                        mcp::create_mcp_tools(name, &tools, mcp_client.clone());
+                    let mcp_tools = mcp::create_mcp_tools(name, &tools, mcp_client.clone());
                     for tool in mcp_tools {
                         registry.register(tool);
                     }
@@ -239,6 +242,7 @@ impl Agent {
             hooks: options.hooks.unwrap_or_default(),
             can_use_tool: options.can_use_tool,
             session_id,
+            abort_signal: options.abort_signal.unwrap_or_default(),
         })
     }
 
@@ -267,6 +271,7 @@ impl Agent {
         let max_tokens = self.max_tokens;
         let registry = std::sync::Arc::new(self.registry_snapshot());
         let can_use_tool = self.can_use_tool.clone();
+        let abort_signal = self.abort_signal.clone();
 
         let handle = tokio::spawn(async move {
             let result: Result<Vec<Message>, String> = super::r#loop::run_loop(
@@ -283,6 +288,7 @@ impl Agent {
                 thinking,
                 max_tokens,
                 can_use_tool.as_ref(),
+                abort_signal,
                 tx.clone(),
             )
             .await;
