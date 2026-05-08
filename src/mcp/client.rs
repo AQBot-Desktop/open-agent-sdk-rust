@@ -45,6 +45,7 @@ impl McpClient {
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
+                hide_windows_console_window(&mut cmd);
 
                 // Inject login-shell PATH so GUI-launched apps can find
                 // tools installed via version managers (nvm, fnm, volta, …)
@@ -202,6 +203,14 @@ impl McpClient {
         }
     }
 }
+
+#[cfg(windows)]
+fn hide_windows_console_window(cmd: &mut Command) {
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_windows_console_window(_cmd: &mut Command) {}
 
 impl Default for McpClient {
     fn default() -> Self {
