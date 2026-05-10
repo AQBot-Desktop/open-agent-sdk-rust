@@ -18,7 +18,6 @@ struct McpConnection {
     child: Option<Child>,
     stdin: Option<tokio::process::ChildStdin>,
     stdout_reader: Option<Arc<RwLock<BufReader<tokio::process::ChildStdout>>>>,
-    request_id: Arc<RwLock<u64>>,
 }
 
 impl McpClient {
@@ -71,7 +70,6 @@ impl McpClient {
                     child: Some(child),
                     stdin: Some(stdin),
                     stdout_reader: Some(Arc::new(RwLock::new(reader))),
-                    request_id: Arc::new(RwLock::new(0)),
                 };
 
                 // Initialize the connection
@@ -114,7 +112,6 @@ impl McpClient {
                     child: None,
                     stdin: None,
                     stdout_reader: None,
-                    request_id: Arc::new(RwLock::new(0)),
                 };
 
                 let mut connections = self.connections.write().await;

@@ -1,4 +1,4 @@
-use crate::types::{ApiToolParam, ContentBlock, Message, SDKMessage, SystemBlock, ThinkingConfig, Usage};
+use crate::types::{ApiToolParam, Message, SDKMessage, SystemBlock, ThinkingConfig, Usage};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::types::{
-    ApiToolParam, ContentBlock, Message, MessageRole, SDKMessage, SystemBlock, ThinkingConfig, Usage,
+    ContentBlock, Message, MessageRole, SDKMessage, Usage,
 };
 
 use super::provider::{ApiType, LLMProvider, ProviderRequest, ProviderResponse};
