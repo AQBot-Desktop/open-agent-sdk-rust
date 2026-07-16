@@ -176,6 +176,10 @@ async fn run_command(
         .current_dir(working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW — 禁止创建控制台窗口
+    }
     if !shell_path.is_empty() {
         cmd.env("PATH", shell_path);
     }
