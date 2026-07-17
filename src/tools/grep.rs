@@ -210,16 +210,19 @@ async fn run_search(
 ) -> Result<String, String> {
     let mut cmd = Command::new(binary);
     cmd.args(args).current_dir("."); // path is already in args
+    let event_context = crate::tools::executor::current_tool_event_context();
 
     let output = command_runner::run_command(
         &mut cmd,
         &context.abort_signal,
         command_runner::CommandRunOptions {
             timeout: None, // no hard timeout — user cancels if too long
-            event_sender: context.event_sender.as_ref(),
+            event_sender: event_context.as_ref().map(|(sender, _)| sender),
             tool_name: binary,
             description: Some("搜索中"),
-            tool_use_id: context.tool_use_id.as_deref(),
+            tool_use_id: event_context
+                .as_ref()
+                .map(|(_, tool_use_id)| tool_use_id.as_str()),
         },
     )
     .await?;

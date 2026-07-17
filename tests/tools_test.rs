@@ -1,10 +1,39 @@
-use open_agent_sdk::tools::ToolRegistry;
-use open_agent_sdk::types::{SDKMessage, Tool, ToolError, ToolUseContext};
+use open_agent_sdk::tools::command_runner::{run_command, CmdOutput, CommandRunOptions};
+use open_agent_sdk::tools::{execute_tools, ToolRegistry};
+use open_agent_sdk::types::{
+    ContentBlock, Message, MessageRole, SDKMessage, Tool, ToolError, ToolUseContext,
+};
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 fn create_test_context(dir: &str) -> ToolUseContext {
     ToolUseContext::new(dir.to_string())
+}
+
+#[cfg(unix)]
+async fn run_test_command(
+    command: &str,
+    timeout: Duration,
+    event_sender: Option<&tokio::sync::mpsc::Sender<SDKMessage>>,
+    tool_use_id: Option<&str>,
+) -> Result<CmdOutput, String> {
+    let mut process = Command::new("sh");
+    process.args(["-c", command]).current_dir("/tmp");
+    run_command(
+        &mut process,
+        &CancellationToken::new(),
+        CommandRunOptions {
+            timeout: Some(timeout),
+            event_sender,
+            tool_name: "test command",
+            description: Some("test command"),
+            tool_use_id,
+        },
+    )
+    .await
 }
 
 // --- Registry Tests ---
@@ -142,20 +171,21 @@ async fn test_bash_timeout() {
     assert!(result.get_text().contains("timed out"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_bash_timeout_clears_status() {
-    let registry = ToolRegistry::default_registry();
-    let bash = registry.get("Bash").unwrap();
-    let mut ctx = create_test_context("/tmp");
     let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(16);
-    ctx.event_sender = Some(event_sender);
 
-    let result = bash
-        .call(json!({"command": "sleep 5", "timeout": 20}), &ctx)
-        .await
-        .unwrap();
+    let result = run_test_command(
+        "sleep 5",
+        Duration::from_millis(20),
+        Some(&event_sender),
+        None,
+    )
+    .await
+    .unwrap_err();
 
-    assert!(result.is_error);
+    assert!(result.contains("timed out"));
     assert!(
         std::iter::from_fn(|| event_receiver.try_recv().ok()).any(|message| {
             matches!(message, SDKMessage::Status { message } if message.is_empty())
@@ -163,53 +193,87 @@ async fn test_bash_timeout_clears_status() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_bash_does_not_block_when_event_channel_is_full() {
-    open_agent_sdk::mcp::shell_path::get_shell_path();
-    let registry = ToolRegistry::default_registry();
-    let bash = registry.get("Bash").unwrap();
-    let mut ctx = create_test_context("/tmp");
     let (event_sender, _event_receiver) = tokio::sync::mpsc::channel(1);
     event_sender
         .try_send(SDKMessage::Status {
             message: "occupied".to_string(),
         })
         .unwrap();
-    ctx.event_sender = Some(event_sender);
 
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        bash.call(json!({"command": "sleep 5", "timeout": 20}), &ctx),
+        std::time::Duration::from_secs(2),
+        run_test_command(
+            "sleep 5",
+            Duration::from_millis(20),
+            Some(&event_sender),
+            None,
+        ),
     )
     .await
-    .expect("a full event channel must not block command timeout")
-    .unwrap();
+    .expect("a full event channel must not block command timeout indefinitely")
+    .unwrap_err();
 
-    assert!(result.is_error);
-    assert!(result.get_text().contains("timed out"));
+    assert!(result.contains("timed out"));
+    assert!(result.contains("event channel remained full"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_final_events_survive_temporary_channel_backpressure() {
+    let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(1);
+    event_sender
+        .try_send(SDKMessage::Status {
+            message: "occupied".to_string(),
+        })
+        .unwrap();
+    let receiver = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        event_receiver.recv().await.unwrap();
+        let output = event_receiver.recv().await.unwrap();
+        let clear = event_receiver.recv().await.unwrap();
+        (output, clear)
+    });
+
+    let output = run_test_command(
+        "printf done",
+        Duration::from_secs(1),
+        Some(&event_sender),
+        Some("backpressure"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(output.exit_code, 0);
+
+    let (output_event, clear_event) = tokio::time::timeout(Duration::from_secs(1), receiver)
+        .await
+        .expect("final events should be delivered after capacity becomes available")
+        .unwrap();
+    assert!(matches!(
+        output_event,
+        SDKMessage::ToolOutput { tool_use_id, content, .. }
+            if tool_use_id == "backpressure" && content == "done"
+    ));
+    assert!(matches!(clear_event, SDKMessage::Status { message } if message.is_empty()));
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn test_bash_streams_long_unicode_status() {
-    let registry = ToolRegistry::default_registry();
-    let bash = registry.get("Bash").unwrap();
-    let mut ctx = create_test_context("/tmp");
     let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(16);
-    ctx.event_sender = Some(event_sender);
-    ctx.tool_use_id = Some("unicode-status".to_string());
 
-    let result = bash
-        .call(
-            json!({
-                "command": "printf '你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好'; sleep 2",
-                "timeout": 5000
-            }),
-            &ctx,
-        )
+    let result = run_test_command(
+        "printf '你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好你好'; sleep 2",
+        Duration::from_secs(5),
+        Some(&event_sender),
+        Some("unicode-status"),
+    )
         .await
         .unwrap();
 
-    assert!(!result.is_error);
+    assert_eq!(result.exit_code, 0);
     let statuses: Vec<String> = std::iter::from_fn(|| event_receiver.try_recv().ok())
         .filter_map(|message| match message {
             SDKMessage::Status { message } if !message.is_empty() => Some(message),
@@ -219,24 +283,21 @@ async fn test_bash_streams_long_unicode_status() {
     assert!(statuses.iter().any(|message| message.ends_with("...")));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_bash_streams_stderr_output() {
-    let registry = ToolRegistry::default_registry();
-    let bash = registry.get("Bash").unwrap();
-    let mut ctx = create_test_context("/tmp");
     let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(16);
-    ctx.event_sender = Some(event_sender);
-    ctx.tool_use_id = Some("stderr-output".to_string());
 
-    let result = bash
-        .call(
-            json!({"command": "printf 'streamed error' >&2", "timeout": 5000}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+    let result = run_test_command(
+        "printf 'streamed error' >&2",
+        Duration::from_secs(5),
+        Some(&event_sender),
+        Some("stderr-output"),
+    )
+    .await
+    .unwrap();
 
-    assert!(!result.is_error);
+    assert_eq!(result.exit_code, 0);
     let streamed_output: Vec<String> = std::iter::from_fn(|| event_receiver.try_recv().ok())
         .filter_map(|message| match message {
             SDKMessage::ToolOutput { content, .. } => Some(content),
@@ -246,6 +307,144 @@ async fn test_bash_streams_stderr_output() {
     assert!(streamed_output
         .iter()
         .any(|content| content.contains("streamed error")));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_command_timeout_kills_process_group() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_path = temp.path().join("descendant.pid");
+    let command = format!("sleep 30 & echo $! > '{}'; wait", pid_path.display());
+
+    let error = run_test_command(&command, Duration::from_millis(150), None, None)
+        .await
+        .unwrap_err();
+    assert!(error.contains("timed out"));
+
+    let pid: i32 = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mut process_exists = true;
+    for _ in 0..20 {
+        // SAFETY: signal 0 only checks whether the pid still exists.
+        process_exists = unsafe { libc::kill(pid, 0) } == 0;
+        if !process_exists {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!process_exists, "descendant process {pid} survived timeout");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_executor_cancellation_kills_process_group() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_path = temp.path().join("executor-descendant.pid");
+    let command = format!("sleep 30 & echo $! > '{}'; wait", pid_path.display());
+    let message = Message {
+        role: MessageRole::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "cancelled-bash".to_string(),
+            name: "Bash".to_string(),
+            input: json!({"command": command, "timeout": 60_000}),
+        }],
+    };
+    let cancellation = CancellationToken::new();
+    let context = ToolUseContext::with_abort(
+        temp.path().to_string_lossy().to_string(),
+        cancellation.clone(),
+    );
+    let registry = ToolRegistry::default_registry();
+    let execution =
+        tokio::spawn(async move { execute_tools(&message, &registry, &context, None, None).await });
+
+    for _ in 0..40 {
+        if pid_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        pid_path.exists(),
+        "bash did not start its descendant process"
+    );
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(3), execution)
+        .await
+        .expect("executor cancellation should finish after process cleanup")
+        .unwrap();
+
+    let pid: i32 = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mut process_exists = true;
+    for _ in 0..20 {
+        // SAFETY: signal 0 only checks whether the pid still exists.
+        process_exists = unsafe { libc::kill(pid, 0) } == 0;
+        if !process_exists {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !process_exists,
+        "descendant process {pid} survived cancellation"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_executor_cancels_while_tool_start_is_backpressured() {
+    let message = Message {
+        role: MessageRole::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "blocked-start".to_string(),
+            name: "Bash".to_string(),
+            input: json!({"command": "sleep 30"}),
+        }],
+    };
+    let cancellation = CancellationToken::new();
+    let context = ToolUseContext::with_abort("/tmp".to_string(), cancellation.clone());
+    let registry = ToolRegistry::default_registry();
+    let (event_sender, _event_receiver) = tokio::sync::mpsc::channel(1);
+    event_sender
+        .try_send(SDKMessage::Status {
+            message: "occupied".to_string(),
+        })
+        .unwrap();
+    let execution = tokio::spawn(async move {
+        execute_tools(&message, &registry, &context, None, Some(event_sender)).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    cancellation.cancel();
+    let results = tokio::time::timeout(Duration::from_secs(1), execution)
+        .await
+        .expect("tool-start backpressure must remain cancellable")
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0]
+        .2
+        .get_text()
+        .contains("Tool aborted before start"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_command_output_reports_capture_truncation() {
+    let output = run_test_command("yes x | head -c 210000", Duration::from_secs(5), None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(output.exit_code, 0);
+    assert!(output.stdout.ends_with("\n... (stdout truncated)"));
+    assert!(output.stdout.len() <= 200_000);
 }
 
 #[tokio::test]

@@ -79,7 +79,7 @@ impl Tool for EnterWorktreeTool {
                 event_sender: None,
                 tool_name: "EnterWorktree",
                 description: None,
-                tool_use_id: context.tool_use_id.as_deref(),
+                tool_use_id: None,
             },
         )
         .await;
@@ -122,7 +122,7 @@ impl Tool for EnterWorktreeTool {
                 event_sender: None,
                 tool_name: "EnterWorktree",
                 description: None,
-                tool_use_id: context.tool_use_id.as_deref(),
+                tool_use_id: None,
             },
         )
         .await;
@@ -140,7 +140,7 @@ impl Tool for EnterWorktreeTool {
                 event_sender: None,
                 tool_name: "EnterWorktree",
                 description: None,
-                tool_use_id: context.tool_use_id.as_deref(),
+                tool_use_id: None,
             },
         )
         .await;
@@ -252,7 +252,7 @@ impl Tool for ExitWorktreeTool {
                     event_sender: None,
                     tool_name: "ExitWorktree",
                     description: None,
-                    tool_use_id: context.tool_use_id.as_deref(),
+                    tool_use_id: None,
                 },
             )
             .await;
@@ -276,7 +276,7 @@ impl Tool for ExitWorktreeTool {
                     event_sender: None,
                     tool_name: "ExitWorktree",
                     description: None,
-                    tool_use_id: context.tool_use_id.as_deref(),
+                    tool_use_id: None,
                 },
             )
             .await;

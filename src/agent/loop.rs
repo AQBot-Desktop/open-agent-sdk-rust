@@ -27,12 +27,7 @@ pub(crate) async fn run_loop(
     shell_binary: Option<String>,
     tx: mpsc::Sender<SDKMessage>,
 ) -> Result<Vec<Message>, String> {
-    let tool_context = ToolUseContext::with_shell_and_events(
-        cwd.to_string(),
-        abort_signal,
-        shell_binary,
-        Some(tx.clone()),
-    );
+    let tool_context = ToolUseContext::with_shell(cwd.to_string(), abort_signal, shell_binary);
 
     // Build system prompt blocks
     let system_blocks =
@@ -179,18 +174,17 @@ pub(crate) async fn run_loop(
 
         // Execute tools
         let tool_start = std::time::Instant::now();
-        let results = tokio::select! {
-            results = tools::execute_tools(
-                &assistant_msg,
-                &registry,
-                &tool_context,
-                can_use_tool,
-                Some(tx.clone()),
-            ) => results,
-            _ = tool_context.abort_signal.cancelled() => {
-                return Err("Agent cancelled".to_string());
-            }
-        };
+        let results = tools::execute_tools(
+            &assistant_msg,
+            &registry,
+            &tool_context,
+            can_use_tool,
+            Some(tx.clone()),
+        )
+        .await;
+        if tool_context.abort_signal.is_cancelled() {
+            return Err("Agent cancelled".to_string());
+        }
         let tool_duration = tool_start.elapsed().as_millis() as u64;
         cost_tracker.add_tool_duration(tool_duration).await;
 

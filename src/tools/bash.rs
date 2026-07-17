@@ -123,16 +123,19 @@ impl Tool for BashTool {
             .and_then(|t| t.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .min(MAX_TIMEOUT_MS);
+        let event_context = crate::tools::executor::current_tool_event_context();
 
         let output = command_runner::run_command(
             &mut cmd,
             &context.abort_signal,
             command_runner::CommandRunOptions {
                 timeout: Some(std::time::Duration::from_millis(timeout_ms)),
-                event_sender: context.event_sender.as_ref(),
+                event_sender: event_context.as_ref().map(|(sender, _)| sender),
                 tool_name: "Bash",
                 description,
-                tool_use_id: context.tool_use_id.as_deref(),
+                tool_use_id: event_context
+                    .as_ref()
+                    .map(|(_, tool_use_id)| tool_use_id.as_str()),
             },
         )
         .await;

@@ -8,6 +8,24 @@ use tokio::sync::mpsc;
 
 use super::registry::ToolRegistry;
 
+const TOOL_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Clone)]
+struct ToolEventContext {
+    sender: mpsc::Sender<SDKMessage>,
+    tool_use_id: String,
+}
+
+tokio::task_local! {
+    static TOOL_EVENT_CONTEXT: ToolEventContext;
+}
+
+pub(crate) fn current_tool_event_context() -> Option<(mpsc::Sender<SDKMessage>, String)> {
+    TOOL_EVENT_CONTEXT
+        .try_with(|context| (context.sender.clone(), context.tool_use_id.clone()))
+        .ok()
+}
+
 /// Execute a set of tool calls from an assistant message.
 /// Concurrent-safe tools run in parallel; others run sequentially.
 pub async fn execute_tools(
@@ -60,26 +78,36 @@ pub async fn execute_tools(
     if !concurrent_calls.is_empty() {
         let mut handles = Vec::new();
         for (id, name, input, tool) in concurrent_calls {
-            let mut ctx = context.clone();
+            let ctx = context.clone();
             let perm_fn = permission_fn.cloned();
             let tool = tool.clone();
             let sender = event_sender.clone();
             handles.push(tokio::spawn(async move {
-                if let Some(sender) = &sender {
-                    let _ = sender
-                        .send(SDKMessage::ToolStart {
-                            tool_use_id: id.clone(),
-                            tool_name: name.clone(),
-                            input: input.clone(),
-                        })
-                        .await;
+                if let Err(message) = send_tool_start(
+                    sender.as_ref(),
+                    &ctx.abort_signal,
+                    SDKMessage::ToolStart {
+                        tool_use_id: id.clone(),
+                        tool_name: name.clone(),
+                        input: input.clone(),
+                    },
+                )
+                .await
+                {
+                    return (id, name, ToolResult::error(message));
                 }
                 let input =
                     check_permission(&name, input, perm_fn.as_ref(), &ctx.abort_signal).await;
                 match input {
                     Ok(input) => {
-                        ctx.tool_use_id = Some(id.clone());
-                        let result = call_tool_with_cancel(tool.as_ref(), input, &ctx).await;
+                        let result = call_tool_with_events(
+                            tool.as_ref(),
+                            input,
+                            &ctx,
+                            sender.clone(),
+                            id.clone(),
+                        )
+                        .await;
                         let tool_result = match result {
                             Ok(r) => r,
                             Err(e) => ToolResult::error(e.to_string()),
@@ -100,21 +128,31 @@ pub async fn execute_tools(
 
     // Run sequential tools one at a time
     for (id, name, input, tool) in sequential_calls {
-        if let Some(sender) = &event_sender {
-            let _ = sender
-                .send(SDKMessage::ToolStart {
-                    tool_use_id: id.clone(),
-                    tool_name: name.clone(),
-                    input: input.clone(),
-                })
-                .await;
+        if let Err(message) = send_tool_start(
+            event_sender.as_ref(),
+            &context.abort_signal,
+            SDKMessage::ToolStart {
+                tool_use_id: id.clone(),
+                tool_name: name.clone(),
+                input: input.clone(),
+            },
+        )
+        .await
+        {
+            results.push((id, name, ToolResult::error(message)));
+            continue;
         }
         let input = check_permission(&name, input, permission_fn, &context.abort_signal).await;
         match input {
             Ok(input) => {
-                let mut ctx = context.clone();
-                ctx.tool_use_id = Some(id.clone());
-                let result = call_tool_with_cancel(tool.as_ref(), input, &ctx).await;
+                let result = call_tool_with_events(
+                    tool.as_ref(),
+                    input,
+                    context,
+                    event_sender.clone(),
+                    id.clone(),
+                )
+                .await;
                 let tool_result = match result {
                     Ok(r) => r,
                     Err(e) => ToolResult::error(e.to_string()),
@@ -128,6 +166,23 @@ pub async fn execute_tools(
     }
 
     results
+}
+
+async fn send_tool_start(
+    sender: Option<&mpsc::Sender<SDKMessage>>,
+    abort_signal: &tokio_util::sync::CancellationToken,
+    message: SDKMessage,
+) -> Result<(), String> {
+    let Some(sender) = sender else {
+        return Ok(());
+    };
+
+    tokio::select! {
+        biased;
+        _ = abort_signal.cancelled() => Err("Tool aborted before start".to_string()),
+        result = sender.send(message) => result
+            .map_err(|_| "Event receiver dropped before tool start".to_string()),
+    }
 }
 
 async fn check_permission(
@@ -160,9 +215,41 @@ async fn call_tool_with_cancel(
     input: Value,
     context: &ToolUseContext,
 ) -> Result<ToolResult, ToolError> {
+    let call = tool.call(input, context);
+    tokio::pin!(call);
     tokio::select! {
-        result = tool.call(input, context) => result,
-        _ = context.abort_signal.cancelled() => Ok(ToolResult::error("Tool aborted")),
+        biased;
+        result = &mut call => result,
+        _ = context.abort_signal.cancelled() => {
+            match tokio::time::timeout(TOOL_CANCEL_GRACE, &mut call).await {
+                Ok(result) => result,
+                Err(_) => Ok(ToolResult::error("Tool aborted before cleanup completed")),
+            }
+        },
+    }
+}
+
+async fn call_tool_with_events(
+    tool: &dyn Tool,
+    input: Value,
+    context: &ToolUseContext,
+    event_sender: Option<mpsc::Sender<SDKMessage>>,
+    tool_use_id: String,
+) -> Result<ToolResult, ToolError> {
+    let call = call_tool_with_cancel(tool, input, context);
+    match event_sender {
+        Some(sender) => {
+            TOOL_EVENT_CONTEXT
+                .scope(
+                    ToolEventContext {
+                        sender,
+                        tool_use_id,
+                    },
+                    call,
+                )
+                .await
+        }
+        None => call.await,
     }
 }
 

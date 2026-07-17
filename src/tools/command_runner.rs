@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::types::SDKMessage;
 
 /// Result of a completed command execution.
+#[derive(Debug)]
 pub struct CmdOutput {
     pub stdout: String,
     pub stderr: String,
@@ -38,13 +39,23 @@ const STALL_THRESHOLD: Duration = Duration::from_secs(90);
 const LAST_OUTPUT_CHARS: usize = 500;
 const OUTPUT_THROTTLE_MS: u64 = 200;
 const MAX_CAPTURE_BYTES: usize = 200_000;
+const FINAL_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
-fn append_capped(buffer: &mut Vec<u8>, data: &[u8]) -> bool {
-    let remaining = MAX_CAPTURE_BYTES.saturating_sub(buffer.len());
-    if remaining == 0 {
+fn append_capped(buffer: &mut Vec<u8>, data: &[u8], truncated: &mut bool, marker: &[u8]) -> bool {
+    if *truncated {
         return false;
     }
-    buffer.extend_from_slice(&data[..data.len().min(remaining)]);
+
+    let content_limit = MAX_CAPTURE_BYTES.saturating_sub(marker.len());
+    let remaining = content_limit.saturating_sub(buffer.len());
+    if data.len() <= remaining {
+        buffer.extend_from_slice(data);
+        return !data.is_empty();
+    }
+
+    buffer.extend_from_slice(&data[..remaining]);
+    buffer.extend_from_slice(marker);
+    *truncated = true;
     true
 }
 
@@ -93,15 +104,46 @@ fn normalized_stream_output(stdout: &[u8], stderr: &[u8]) -> String {
     output
 }
 
-fn clear_status(event_sender: Option<&mpsc::Sender<SDKMessage>>) {
+async fn clear_status(event_sender: Option<&mpsc::Sender<SDKMessage>>) -> Result<(), String> {
     if let Some(sender) = event_sender {
-        send_event(
+        send_final_events(
             sender,
-            SDKMessage::Status {
+            [SDKMessage::Status {
                 message: String::new(),
-            },
-            "status_clear",
-        );
+            }],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn send_final_events(
+    sender: &mpsc::Sender<SDKMessage>,
+    messages: impl IntoIterator<Item = SDKMessage>,
+) -> Result<(), String> {
+    for message in messages {
+        match sender.send_timeout(message, FINAL_EVENT_SEND_TIMEOUT).await {
+            Ok(()) => {}
+            Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+                return Err(
+                    "event channel remained full while sending final command events".into(),
+                );
+            }
+            Err(mpsc::error::SendTimeoutError::Closed(_)) => {
+                return Err("event receiver dropped while sending final command events".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn command_error_with_status_clear(
+    event_sender: Option<&mpsc::Sender<SDKMessage>>,
+    command_error: String,
+) -> String {
+    match clear_status(event_sender).await {
+        Ok(()) => command_error,
+        Err(event_error) => format!("{}; {}", command_error, event_error),
     }
 }
 
@@ -160,13 +202,23 @@ pub async fn run_command(
     } = options;
 
     if abort_signal.is_cancelled() {
-        clear_status(event_sender);
-        return Err(format!("{} aborted", tool_name));
+        return Err(command_error_with_status_clear(
+            event_sender,
+            format!("{} aborted", tool_name),
+        )
+        .await);
     }
 
     #[cfg(windows)]
     {
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    #[cfg(unix)]
+    {
+        // Put the command in its own process group so cancellation and timeout
+        // can terminate the shell and every descendant it started.
+        cmd.process_group(0);
     }
 
     let mut child = cmd
@@ -259,6 +311,8 @@ pub async fn run_command(
 
     let mut stdout_bytes: Vec<u8> = Vec::new();
     let mut stderr_bytes: Vec<u8> = Vec::new();
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
     let start = Instant::now();
     let mut last_data_time = Instant::now();
     let mut last_output_time = Instant::now();
@@ -276,16 +330,41 @@ pub async fn run_command(
             biased;
             _ = abort_signal.cancelled() => {
                 kill_child(&mut child).await;
-                clear_status(event_sender);
-                return Err(format!("{} aborted", tool_name));
+                return Err(command_error_with_status_clear(
+                    event_sender,
+                    format!("{} aborted", tool_name),
+                ).await);
+            }
+            _ = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d.into()).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                kill_child(&mut child).await;
+                let elapsed = start.elapsed().as_secs();
+                return Err(command_error_with_status_clear(
+                    event_sender,
+                    format!("{} timed out after {}s", tool_name, elapsed),
+                ).await);
             }
             chunk = chunk_rx.recv() => {
                 match chunk {
                     Some(PipeMessage::Data { is_stdout, data }) => {
                         let output_changed = if is_stdout {
-                            append_capped(&mut stdout_bytes, &data)
+                            append_capped(
+                                &mut stdout_bytes,
+                                &data,
+                                &mut stdout_truncated,
+                                b"\n... (stdout truncated)",
+                            )
                         } else {
-                            append_capped(&mut stderr_bytes, &data)
+                            append_capped(
+                                &mut stderr_bytes,
+                                &data,
+                                &mut stderr_truncated,
+                                b"\n... (stderr truncated)",
+                            )
                         };
                         last_data_time = Instant::now();
 
@@ -314,16 +393,20 @@ pub async fn run_command(
                     }
                     Some(PipeMessage::ReadError { stream, error }) => {
                         kill_child(&mut child).await;
-                        clear_status(event_sender);
-                        return Err(format!("Failed to read {} from {}: {}", stream, tool_name, error));
+                        return Err(command_error_with_status_clear(
+                            event_sender,
+                            format!("Failed to read {} from {}: {}", stream, tool_name, error),
+                        ).await);
                     }
                     None => {
                         // Both pipe readers finished; wait for process exit
                         match child.wait().await {
                             Ok(status) => break status,
                             Err(error) => {
-                                clear_status(event_sender);
-                                return Err(format!("Failed to wait for {}: {}", tool_name, error));
+                                return Err(command_error_with_status_clear(
+                                    event_sender,
+                                    format!("Failed to wait for {}: {}", tool_name, error),
+                                ).await);
                             }
                         }
                     }
@@ -373,36 +456,25 @@ pub async fn run_command(
                     send_event(sender, SDKMessage::Progress { message: msg }, "progress");
                 }
             }
-            _ = async {
-                match deadline {
-                    Some(d) => tokio::time::sleep_until(d.into()).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
-                kill_child(&mut child).await;
-                clear_status(event_sender);
-                let elapsed = start.elapsed().as_secs();
-                return Err(format!("{} timed out after {}s", tool_name, elapsed));
-            }
         }
     };
 
     // Final flush: send complete output after process exits
-    if let Some(ref sender) = event_sender {
+    if let Some(sender) = event_sender {
+        let mut final_events = Vec::with_capacity(2);
         if let Some(ref tuid) = tool_use_id {
             let full = normalized_stream_output(&stdout_bytes, &stderr_bytes);
-            send_event(
-                sender,
-                SDKMessage::ToolOutput {
-                    tool_use_id: tuid.clone(),
-                    tool_name: tool_name.to_string(),
-                    content: full,
-                },
-                "tool_output",
-            );
+            final_events.push(SDKMessage::ToolOutput {
+                tool_use_id: tuid.clone(),
+                tool_name: tool_name.to_string(),
+                content: full,
+            });
         }
+        final_events.push(SDKMessage::Status {
+            message: String::new(),
+        });
+        send_final_events(sender, final_events).await?;
     }
-    clear_status(event_sender);
 
     let exit_code = status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&stdout_bytes)
@@ -420,6 +492,21 @@ pub async fn run_command(
 }
 
 async fn kill_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // SAFETY: killpg does not dereference pointers. The child was
+            // spawned into a process group whose id is its pid above.
+            let result = unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    tracing::warn!(pid, %error, "failed to kill command process group");
+                }
+            }
+        }
+    }
+
     #[cfg(windows)]
     {
         // On Windows, child.kill() only kills the immediate shell (e.g. cmd.exe),
