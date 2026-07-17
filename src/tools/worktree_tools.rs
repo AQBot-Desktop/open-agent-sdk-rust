@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
+use crate::tools::command_runner;
 use crate::types::{Tool, ToolError, ToolInputSchema, ToolResult, ToolUseContext};
 
 /// Info about an active worktree.
@@ -67,15 +67,24 @@ impl Tool for EnterWorktreeTool {
 
     async fn call(&self, input: Value, context: &ToolUseContext) -> Result<ToolResult, ToolError> {
         // Check if we're in a git repo
-        let check = Command::new("git")
+        let mut check_cmd = Command::new("git");
+        check_cmd
             .args(["rev-parse", "--git-dir"])
-            .current_dir(&context.working_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
+            .current_dir(&context.working_dir);
+        let check = command_runner::run_command(
+            &mut check_cmd,
+            &context.abort_signal,
+            command_runner::CommandRunOptions {
+                timeout: Some(std::time::Duration::from_secs(10)),
+                event_sender: None,
+                tool_name: "EnterWorktree",
+                description: None,
+                tool_use_id: None,
+            },
+        )
+        .await;
 
-        if check.is_err() || !check.unwrap().status.success() {
+        if check.is_err() || check.as_ref().is_ok_and(|o| o.exit_code != 0) {
             return Ok(ToolResult::error("Not in a git repository"));
         }
 
@@ -101,25 +110,43 @@ impl Tool for EnterWorktreeTool {
             });
 
         // Create branch if it doesn't exist (ignore errors if it already exists)
-        let _ = Command::new("git")
+        let mut branch_cmd = Command::new("git");
+        branch_cmd
             .args(["branch", &branch])
-            .current_dir(&context.working_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
+            .current_dir(&context.working_dir);
+        let _ = command_runner::run_command(
+            &mut branch_cmd,
+            &context.abort_signal,
+            command_runner::CommandRunOptions {
+                timeout: Some(std::time::Duration::from_secs(10)),
+                event_sender: None,
+                tool_name: "EnterWorktree",
+                description: None,
+                tool_use_id: None,
+            },
+        )
+        .await;
 
         // Create worktree
-        let result = Command::new("git")
+        let mut add_cmd = Command::new("git");
+        add_cmd
             .args(["worktree", "add", &worktree_path, &branch])
-            .current_dir(&context.working_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
+            .current_dir(&context.working_dir);
+        let result = command_runner::run_command(
+            &mut add_cmd,
+            &context.abort_signal,
+            command_runner::CommandRunOptions {
+                timeout: Some(std::time::Duration::from_secs(10)),
+                event_sender: None,
+                tool_name: "EnterWorktree",
+                description: None,
+                tool_use_id: None,
+            },
+        )
+        .await;
 
         match result {
-            Ok(output) if output.status.success() => {
+            Ok(out) if out.exit_code == 0 => {
                 let id = uuid::Uuid::new_v4().to_string();
                 let info = WorktreeInfo {
                     path: worktree_path.clone(),
@@ -135,17 +162,14 @@ impl Tool for EnterWorktreeTool {
                     id, worktree_path, branch
                 )))
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(out) => {
+                let stderr = out.stderr;
                 Ok(ToolResult::error(format!(
                     "Error creating worktree: {}",
                     stderr
                 )))
             }
-            Err(e) => Ok(ToolResult::error(format!(
-                "Error creating worktree: {}",
-                e
-            ))),
+            Err(e) => Ok(ToolResult::error(format!("Error creating worktree: {}", e))),
         }
     }
 }
@@ -196,7 +220,7 @@ impl Tool for ExitWorktreeTool {
         }
     }
 
-    async fn call(&self, input: Value, _context: &ToolUseContext) -> Result<ToolResult, ToolError> {
+    async fn call(&self, input: Value, context: &ToolUseContext) -> Result<ToolResult, ToolError> {
         let id = input
             .get("id")
             .and_then(|v| v.as_str())
@@ -213,36 +237,59 @@ impl Tool for ExitWorktreeTool {
             None => return Ok(ToolResult::error(format!("Worktree not found: {}", id))),
         };
 
+        let mut branch_cleanup_warning = None;
         if action == "remove" {
             // Remove worktree
-            let result = Command::new("git")
+            let mut remove_cmd = Command::new("git");
+            remove_cmd
                 .args(["worktree", "remove", &worktree.path, "--force"])
-                .current_dir(&worktree.original_cwd)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .await;
+                .current_dir(&worktree.original_cwd);
+            let result = command_runner::run_command(
+                &mut remove_cmd,
+                &context.abort_signal,
+                command_runner::CommandRunOptions {
+                    timeout: Some(std::time::Duration::from_secs(10)),
+                    event_sender: None,
+                    tool_name: "ExitWorktree",
+                    description: None,
+                    tool_use_id: None,
+                },
+            )
+            .await;
 
-            if let Ok(output) = result {
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Ok(ToolResult::error(format!("Error: {}", stderr)));
-                }
+            match result {
+                Ok(out) if out.exit_code == 0 => {}
+                Ok(out) => return Ok(ToolResult::error(format!("Error: {}", out.stderr))),
+                Err(error) => return Ok(ToolResult::error(format!("Error: {}", error))),
             }
 
-            // Try to delete the branch (ignore errors)
-            let _ = Command::new("git")
+            // The worktree is already removed at this point; report branch cleanup separately.
+            let mut branch_cmd = Command::new("git");
+            branch_cmd
                 .args(["branch", "-D", &worktree.branch])
-                .current_dir(&worktree.original_cwd)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .await;
+                .current_dir(&worktree.original_cwd);
+            let branch_result = command_runner::run_command(
+                &mut branch_cmd,
+                &context.abort_signal,
+                command_runner::CommandRunOptions {
+                    timeout: Some(std::time::Duration::from_secs(10)),
+                    event_sender: None,
+                    tool_name: "ExitWorktree",
+                    description: None,
+                    tool_use_id: None,
+                },
+            )
+            .await;
+            match branch_result {
+                Ok(out) if out.exit_code == 0 => {}
+                Ok(out) => branch_cleanup_warning = Some(out.stderr),
+                Err(error) => branch_cleanup_warning = Some(error),
+            }
         }
 
         store.remove(id);
 
-        Ok(ToolResult::text(format!(
+        let mut message = format!(
             "Worktree {}: {}",
             if action == "remove" {
                 "removed"
@@ -250,6 +297,10 @@ impl Tool for ExitWorktreeTool {
                 "kept"
             },
             worktree.path
-        )))
+        );
+        if let Some(warning) = branch_cleanup_warning {
+            message.push_str(&format!("\nBranch cleanup warning: {}", warning));
+        }
+        Ok(ToolResult::text(message))
     }
 }

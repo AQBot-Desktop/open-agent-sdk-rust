@@ -108,7 +108,12 @@ pub struct ToolUseContext {
 
 impl ToolUseContext {
     pub fn new(working_dir: String) -> Self {
-        Self::with_abort(working_dir, tokio_util::sync::CancellationToken::new())
+        Self {
+            working_dir,
+            abort_signal: tokio_util::sync::CancellationToken::new(),
+            read_file_state: Arc::new(RwLock::new(HashMap::new())),
+            shell_binary: None,
+        }
     }
 
     pub fn with_abort(

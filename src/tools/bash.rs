@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Stdio;
 use tokio::process::Command;
 
+use crate::tools::command_runner;
 use crate::types::{Tool, ToolError, ToolInputSchema, ToolResult, ToolUseContext};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -36,7 +36,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Executes a given bash command and returns its output. Use for system commands and terminal operations that require shell execution."
+        "Executes a given bash command and returns its output. Use for system commands and terminal operations that require shell execution. Long-running commands will periodically report partial output."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -109,83 +109,86 @@ impl Tool for BashTool {
             )));
         }
 
+        // Build shell command
+        let shell = build_shell_runner(command, context.shell_binary.as_deref());
+        let mut cmd = Command::new(&shell.program);
+        cmd.args(&shell.args).current_dir(&context.working_dir);
+        let shell_path = crate::mcp::shell_path::get_shell_path();
+        if !shell_path.is_empty() {
+            cmd.env("PATH", shell_path);
+        }
+        let description = input.get("description").and_then(|d| d.as_str());
         let timeout_ms = input
             .get("timeout")
             .and_then(|t| t.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .min(MAX_TIMEOUT_MS);
+        let event_context = crate::tools::executor::current_tool_event_context();
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            run_command(command, &context.working_dir, context.shell_binary.as_deref()),
+        let output = command_runner::run_command(
+            &mut cmd,
+            &context.abort_signal,
+            command_runner::CommandRunOptions {
+                timeout: Some(std::time::Duration::from_millis(timeout_ms)),
+                event_sender: event_context.as_ref().map(|(sender, _)| sender),
+                tool_name: "Bash",
+                description,
+                tool_use_id: event_context
+                    .as_ref()
+                    .map(|(_, tool_use_id)| tool_use_id.as_str()),
+            },
         )
         .await;
 
         match output {
-            Ok(Ok((stdout, stderr, exit_code))) => {
+            Ok(out) => {
                 let mut result = String::new();
 
-                if !stdout.is_empty() {
-                    result.push_str(&stdout);
+                if !out.stdout.is_empty() {
+                    result.push_str(&out.stdout);
                 }
-                if !stderr.is_empty() {
+                if !out.stderr.is_empty() {
                     if !result.is_empty() {
                         result.push('\n');
                     }
                     result.push_str("STDERR:\n");
-                    result.push_str(&stderr);
+                    result.push_str(&out.stderr);
                 }
 
                 if result.len() > MAX_OUTPUT_SIZE {
-                    result.truncate(MAX_OUTPUT_SIZE);
+                    truncate_utf8(&mut result, MAX_OUTPUT_SIZE);
                     result.push_str("\n... (output truncated)");
                 }
 
-                if exit_code != 0 {
-                    result.push_str(&format!("\n\nExit code: {}", exit_code));
+                if out.exit_code != 0 {
+                    result.push_str(&format!("\n\nExit code: {}", out.exit_code));
                 }
 
                 if result.is_empty() {
                     result = "(no output)".to_string();
                 }
 
-                Ok(if exit_code != 0 {
+                Ok(if out.exit_code != 0 {
                     ToolResult::error(result)
                 } else {
                     ToolResult::text(result)
                 })
             }
-            Ok(Err(e)) => Ok(ToolResult::error(format!("Command failed: {}", e))),
-            Err(_) => Ok(ToolResult::error(format!(
-                "Command timed out after {}ms",
-                timeout_ms
-            ))),
+            Err(e) => Ok(ToolResult::error(format!("Command failed: {}", e))),
         }
     }
 }
 
-async fn run_command(
-    command: &str,
-    working_dir: &str,
-    shell_override: Option<&str>,
-) -> Result<(String, String, i32), std::io::Error> {
-    let shell_path = crate::mcp::shell_path::get_shell_path();
-    let shell = build_shell_runner(command, shell_override);
-    let mut cmd = Command::new(&shell.program);
-    cmd.args(&shell.args)
-        .current_dir(working_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if !shell_path.is_empty() {
-        cmd.env("PATH", shell_path);
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
     }
-    let output = cmd.output().await?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
-
-    Ok((stdout, stderr, exit_code))
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,7 +335,17 @@ fn check_destructive(command: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_shell_runner, try_shell_override, ShellRunner};
+    use super::{select_shell_runner, truncate_utf8, try_shell_override, ShellRunner};
+
+    #[test]
+    fn output_truncation_preserves_utf8_boundaries() {
+        let mut output = "你".repeat(40_000);
+
+        truncate_utf8(&mut output, 100_000);
+
+        assert!(output.len() <= 100_000);
+        assert!(output.ends_with('你'));
+    }
 
     #[test]
     fn shell_override_uses_configured_binary_when_it_exists() {

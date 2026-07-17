@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
+use tokio::process::Command;
 
+use crate::tools::command_runner;
 use crate::types::{Tool, ToolError, ToolInputSchema, ToolResult, ToolUseContext};
 
 /// LSPTool - Language Server Protocol integration.
@@ -86,7 +87,9 @@ impl Tool for LSPTool {
                             r"(?:fn |struct |enum |trait |type |const |let |pub fn |pub struct |pub enum |pub trait |pub type |pub const |impl |mod |use )\s*{}",
                             regex::escape(&sym)
                         );
-                        let result = run_rg_or_grep(&pattern, cwd);
+                        let result = run_rg_or_grep(&pattern, cwd, &context.abort_signal)
+                            .await
+                            .map_err(ToolError::ExecutionError)?;
                         if result.is_empty() {
                             Ok(ToolResult::text(format!("No definition found for \"{}\"", sym)))
                         } else {
@@ -106,7 +109,13 @@ impl Tool for LSPTool {
                 let symbol = get_symbol_at_position(file_path, line as usize, character as usize, cwd);
                 match symbol {
                     Some(sym) => {
-                        let result = run_rg_or_grep(&regex::escape(&sym), cwd);
+                        let result = run_rg_or_grep(
+                            &regex::escape(&sym),
+                            cwd,
+                            &context.abort_signal,
+                        )
+                        .await
+                        .map_err(ToolError::ExecutionError)?;
                         if result.is_empty() {
                             Ok(ToolResult::text(format!("No references found for \"{}\"", sym)))
                         } else {
@@ -126,7 +135,9 @@ impl Tool for LSPTool {
                     .ok_or_else(|| ToolError::InvalidInput("file_path required".to_string()))?;
 
                 let pattern = r"^\s*(pub\s+)?(fn |struct |enum |trait |type |const |let |impl |mod |use )";
-                let result = run_rg_on_file(pattern, file_path, cwd);
+                let result = run_rg_on_file(pattern, file_path, cwd, &context.abort_signal)
+                    .await
+                    .map_err(ToolError::ExecutionError)?;
                 if result.is_empty() {
                     Ok(ToolResult::text("No symbols found"))
                 } else {
@@ -186,60 +197,104 @@ fn is_word_char(b: u8) -> bool {
 }
 
 /// Run ripgrep on the working directory, falling back to grep.
-fn run_rg_or_grep(pattern: &str, cwd: &str) -> String {
+async fn run_rg_or_grep(
+    pattern: &str,
+    cwd: &str,
+    abort_signal: &tokio_util::sync::CancellationToken,
+) -> Result<String, String> {
     // Try ripgrep first
-    if let Ok(output) = Command::new("rg")
-        .args(["-n", pattern, "--type-add", "src:*.{ts,tsx,js,jsx,py,go,rs,java}", "-t", "src"])
-        .arg(cwd)
-        .output()
-    {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            // Limit output to 50 lines
-            let lines: Vec<&str> = text.lines().take(50).collect();
-            return lines.join("\n");
-        }
-    }
+    let mut cmd = Command::new("rg");
+    cmd.args([
+        "-n",
+        pattern,
+        "--type-add",
+        "src:*.{ts,tsx,js,jsx,py,go,rs,java}",
+        "-t",
+        "src",
+    ])
+    .arg(cwd);
 
-    // Fallback to grep
-    if let Ok(output) = Command::new("grep")
-        .args(["-rn", pattern, cwd, "--include=*.rs", "--include=*.ts", "--include=*.py", "--include=*.go", "--include=*.java"])
-        .output()
-    {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let lines: Vec<&str> = text.lines().take(50).collect();
-            return lines.join("\n");
+    let rg_error = match run_search_command(&mut cmd, abort_signal, "rg").await {
+        Ok(Some(output)) => {
+            let lines: Vec<&str> = output.lines().take(50).collect();
+            return Ok(lines.join("\n"));
         }
-    }
+        Ok(None) => return Ok(String::new()),
+        Err(error) => error,
+    };
 
-    String::new()
+    // Fall back only when ripgrep could not execute successfully.
+    let mut cmd = Command::new("grep");
+    cmd.args([
+        "-rn",
+        pattern,
+        cwd,
+        "--include=*.rs",
+        "--include=*.ts",
+        "--include=*.py",
+        "--include=*.go",
+        "--include=*.java",
+    ]);
+
+    match run_search_command(&mut cmd, abort_signal, "grep").await {
+        Ok(Some(output)) => {
+            let lines: Vec<&str> = output.lines().take(50).collect();
+            Ok(lines.join("\n"))
+        }
+        Ok(None) => Ok(String::new()),
+        Err(grep_error) => Err(format!("rg: {}; grep: {}", rg_error, grep_error)),
+    }
 }
 
 /// Run ripgrep on a single file, falling back to grep.
-fn run_rg_on_file(pattern: &str, file_path: &str, cwd: &str) -> String {
+async fn run_rg_on_file(
+    pattern: &str,
+    file_path: &str,
+    cwd: &str,
+    abort_signal: &tokio_util::sync::CancellationToken,
+) -> Result<String, String> {
     let full_path = Path::new(cwd).join(file_path);
-    let path_str = full_path.to_string_lossy();
+    let path_str = full_path.to_string_lossy().to_string();
 
-    if let Ok(output) = Command::new("rg")
-        .args(["-n", pattern])
-        .arg(path_str.as_ref())
-        .output()
-    {
-        if output.status.success() {
-            return String::from_utf8_lossy(&output.stdout).trim().to_string();
-        }
+    let mut cmd = Command::new("rg");
+    cmd.args(["-n", pattern]).arg(&path_str);
+
+    let rg_error = match run_search_command(&mut cmd, abort_signal, "rg").await {
+        Ok(Some(output)) => return Ok(output.trim().to_string()),
+        Ok(None) => return Ok(String::new()),
+        Err(error) => error,
+    };
+
+    let mut cmd = Command::new("grep");
+    cmd.args(["-n", pattern]).arg(&path_str);
+
+    match run_search_command(&mut cmd, abort_signal, "grep").await {
+        Ok(Some(output)) => Ok(output.trim().to_string()),
+        Ok(None) => Ok(String::new()),
+        Err(grep_error) => Err(format!("rg: {}; grep: {}", rg_error, grep_error)),
     }
+}
 
-    if let Ok(output) = Command::new("grep")
-        .args(["-n", pattern])
-        .arg(path_str.as_ref())
-        .output()
-    {
-        if output.status.success() {
-            return String::from_utf8_lossy(&output.stdout).trim().to_string();
-        }
+async fn run_search_command(
+    cmd: &mut Command,
+    abort_signal: &tokio_util::sync::CancellationToken,
+    tool_name: &str,
+) -> Result<Option<String>, String> {
+    let output = command_runner::run_command(
+        cmd,
+        abort_signal,
+        command_runner::CommandRunOptions {
+            timeout: Some(std::time::Duration::from_secs(10)),
+            event_sender: None,
+            tool_name,
+            description: None,
+            tool_use_id: None,
+        },
+    )
+    .await?;
+    match output.exit_code {
+        0 => Ok(Some(output.stdout)),
+        1 => Ok(None),
+        _ => Err(output.stderr),
     }
-
-    String::new()
 }
